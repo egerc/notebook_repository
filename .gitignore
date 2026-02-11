@@ -205,3 +205,8 @@ cython_debug/
 marimo/_static/
 marimo/_lsp/
 __marimo__/
+
+.DS_Store
+
+2026-02-10T09-07-37Z/data
+2026-02-10T09-07-37Z/cache

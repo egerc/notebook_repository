@@ -1,0 +1,12 @@
+[project]
+name = "2026-02-10t09-07-37z"
+version = "0.1.0"
+requires-python = ">=3.11"
+dependencies = [
+    "scanpy>=1.11.5",
+    "scikit-learn>=1.7.2",
+    "nico2-lib @ git+https://github.com/gruenlab/bioinfo-tools.git@35b0bcdfff6050aa0d28c4869e28e4ee5aa59592#subdirectory=applications/nico2_lib",
+    "ipykernel>=7.2.0",
+    "polars>=1.38.1",
+    "umap-learn>=0.5.11",
+]
