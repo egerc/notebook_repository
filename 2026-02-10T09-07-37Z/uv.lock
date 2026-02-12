@@ -24,7 +24,7 @@ dependencies = [
 [package.metadata]
 requires-dist = [
     { name = "ipykernel", specifier = ">=7.2.0" },
-    { name = "nico2-lib", git = "https://github.com/gruenlab/bioinfo-tools.git?subdirectory=applications%2Fnico2_lib&rev=35b0bcdfff6050aa0d28c4869e28e4ee5aa59592" },
+    { name = "nico2-lib", git = "https://github.com/gruenlab/bioinfo-tools.git?subdirectory=applications%2Fnico2_lib&rev=e61ba36e4db5183ef3faad9e1ef11b228bc053f9" },
     { name = "polars", specifier = ">=1.38.1" },
     { name = "scanpy", specifier = ">=1.11.5" },
     { name = "scikit-learn", specifier = ">=1.7.2" },
@@ -2049,7 +2049,7 @@ wheels = [
 [[package]]
 name = "nico2-lib"
 version = "0.1.0"
-source = { git = "https://github.com/gruenlab/bioinfo-tools.git?subdirectory=applications%2Fnico2_lib&rev=35b0bcdfff6050aa0d28c4869e28e4ee5aa59592#35b0bcdfff6050aa0d28c4869e28e4ee5aa59592" }
+source = { git = "https://github.com/gruenlab/bioinfo-tools.git?subdirectory=applications%2Fnico2_lib&rev=e61ba36e4db5183ef3faad9e1ef11b228bc053f9#e61ba36e4db5183ef3faad9e1ef11b228bc053f9" }
 dependencies = [
     { name = "anndata" },
     { name = "ipykernel" },
