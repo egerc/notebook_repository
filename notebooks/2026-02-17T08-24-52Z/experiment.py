@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import json
 import logging
 import pickle
 import tempfile
 from collections.abc import Sequence
 from dataclasses import dataclass
 from itertools import product
+from pathlib import Path
 from typing import Callable
 
 import mlflow
@@ -17,14 +19,9 @@ from joblib.func_inspect import os
 from nico2_lib.predictors import NmfPredictor
 from numpy import number
 from numpy.typing import NDArray
-
-DATA_DIR = "../data"
-CACHE_DIR = "../cache"
-SEED = 0
-N_SAMPLES = 2
-SAMPLE_LENGTH = 20
-MLFLOW_EXPERIMENT = "nico2_sweep"
-
+from sklearn.decomposition import PCA
+from sklearn.preprocessing import StandardScaler
+from umap import UMAP
 
 if not logging.getLogger().handlers:
     logging.basicConfig(
@@ -88,6 +85,11 @@ def _sample_indices(
     return train_idx, test_idx
 
 
+def _filter_celltypes(adata: AnnData, ct_key: str, min_count: int) -> list[str]:
+    celltypes = adata.obs[ct_key].value_counts()
+    return celltypes[celltypes >= min_count].index.tolist()  # type: ignore
+
+
 @dataclass(frozen=True)
 class PredictorWrapper:
     name: str
@@ -102,22 +104,14 @@ class LoaderFnWrapper:
 
 @dataclass(frozen=True)
 class Config:
-    data_dir: str = "../data"
-    cache_dir: str = "../cache"
-    seed: int = 0
-    n_samples: int = 10
-    sample_length: int = 20
-    mlflow_experiment_name: str = "explainability_benchmark"
-    mlflow_parent_run_name: str = "dataset_predictor_sweep"
-
-
-@dataclass(frozen=True)
-class ExperimentConfig:
-    dataset: tuple[AnnData, AnnData, str, str]
-    predictor: n2l.pd.PredictorProtocol
+    data_dir: str
+    cache_dir: str
     seed: int
     n_samples: int
     sample_length: int
+    n_pca_components: int
+    mlflow_experiment_name: str
+    mlflow_parent_run_name: str
 
 
 @dataclass(frozen=True)
@@ -135,18 +129,23 @@ class SampleResult:
 @dataclass(frozen=True)
 class CelltypeResult:
     celltype: str
+    celltype_pca_embedding: NumericArray
+    celltype_umap_embedding: NumericArray
     global_model: n2l.pd.PredictorProtocol
+    global_model_embedding_size: int
     celltype_model: n2l.pd.PredictorProtocol
+    celltype_model_embedding_size: int
     samples: Sequence[SampleResult]
 
 
-def _run_experiment(
+def run_experiment(
     dataset: tuple[AnnData, AnnData, str, str],
     predictor: n2l.pd.PredictorProtocol,
     *,
     seed: int,
     n_samples: int,
     sample_length: int,
+    n_pca_components: int,
 ) -> list[CelltypeResult]:
     """Run per-celltype masking experiments with global and celltype-specific models.
 
@@ -183,9 +182,13 @@ def _run_experiment(
     _adata_dense_mut(query)
     _adata_dense_mut(reference)
 
-    query_celltypes = query.obs[query_ct_key].to_numpy()
-    reference_celltypes = reference.obs[reference_ct_key].to_numpy()
-    shared_celltypes = np.intersect1d(query_celltypes, reference_celltypes)
+    # filter to shared celltypes that have at least n_pca_components cells in both datasets
+
+    query_celltypes = _filter_celltypes(query, query_ct_key, n_pca_components)
+    reference_celltypes = _filter_celltypes(
+        reference, reference_ct_key, n_pca_components
+    )
+    shared_celltypes = np.sort(np.intersect1d(query_celltypes, reference_celltypes))
     shared_features = np.intersect1d(query.var_names, reference.var_names)
 
     query_mask = query.obs[query_ct_key].isin(shared_celltypes.tolist())
@@ -204,6 +207,12 @@ def _run_experiment(
         reference_celltype_mask = reference_shared.obs[reference_ct_key] == celltype
         celltype_model = predictor.fit(
             reference_shared[reference_celltype_mask].X  # type: ignore
+        )
+        celltype_pca_embedding = PCA(n_components=n_pca_components).fit_transform(
+            StandardScaler().fit_transform(query_shared[query_celltype_mask].X)
+        )  # type: ignore
+        celltype_umap_embedding = UMAP(n_components=2).fit_transform(
+            celltype_pca_embedding
         )
         sample_results: list[SampleResult] = []
         for idx, (train_idx, test_idx) in enumerate(zip(train_idxs, test_idxs)):
@@ -239,67 +248,77 @@ def _run_experiment(
         celltype_results.append(
             CelltypeResult(
                 celltype=celltype,
+                celltype_pca_embedding=celltype_pca_embedding,
+                celltype_umap_embedding=celltype_umap_embedding,  # type: ignore
                 global_model=global_model,
+                global_model_embedding_size=global_model_embeddings.shape[1],
                 celltype_model=celltype_model,
+                celltype_model_embedding_size=celltype_model_embeddings.shape[1],
                 samples=sample_results,
             )
         )
     return celltype_results
 
 
-def run_experiment(config: ExperimentConfig) -> list[CelltypeResult]:
-    return _run_experiment(
-        dataset=config.dataset,
-        predictor=config.predictor,
-        seed=config.seed,
-        n_samples=config.n_samples,
-        sample_length=config.sample_length,
-    )
+def load_config(config_path: Path | None = None) -> Config:
+    path = config_path or Path(__file__).with_name("config.json")
+    with path.open() as f:
+        raw = json.load(f)
+    return Config(**raw)
+
+
+def _build_dataloaders(cache_dir: str) -> list[LoaderFnWrapper]:
+    return [
+        LoaderFnWrapper(
+            name="small_mouse_intestine_spatial",
+            loader=_create_spatial_loader(
+                query_loader=n2l.dt.small_mouse_intestine_merfish,
+                query_ct_key="cluster",
+                reference_loader=n2l.dt.small_mouse_intestine_sc,
+                reference_ct_key="cluster",
+                memory=Memory(cache_dir),
+            ),
+        ),
+    ]
 
 
 predictors: list[PredictorWrapper] = [
     PredictorWrapper("NMF_3", NmfPredictor(n_components=3)),
     PredictorWrapper("NMF_8", NmfPredictor(n_components=8)),
 ]
-dataloaders: list[LoaderFnWrapper] = [
-    LoaderFnWrapper(
-        name="small_mouse_intestine_spatial",
-        loader=_create_spatial_loader(
-            query_loader=n2l.dt.small_mouse_intestine_merfish,
-            query_ct_key="cluster",
-            reference_loader=n2l.dt.small_mouse_intestine_sc,
-            reference_ct_key="cluster",
-            memory=Memory(CACHE_DIR),
-        ),
-    ),
-]
 
 
 def main() -> None:
-    config = Config()
+    config = load_config()
+    dataloaders = _build_dataloaders(config.cache_dir)
     mlflow.set_experiment(config.mlflow_experiment_name)
     with mlflow.start_run(run_name=config.mlflow_parent_run_name):
         mlflow.log_params(config.__dict__)
+        mlflow.log_params(
+            {
+                "predictor_names": [p.name for p in predictors],
+                "dataloader_names": [d.name for d in dataloaders],
+            }
+        )
         for predictor, dataloader in product(predictors, dataloaders):
             with mlflow.start_run(
                 nested=True, run_name=f"{predictor.name}_{dataloader.name}"
             ):
-                experiment_config = ExperimentConfig(
+                results = run_experiment(
                     dataset=dataloader.loader(config.data_dir),
                     predictor=predictor.predictor,
                     seed=config.seed,
                     n_samples=config.n_samples,
                     sample_length=config.sample_length,
+                    n_pca_components=config.n_pca_components,
                 )
-
-                results = run_experiment(experiment_config)
 
                 with tempfile.TemporaryDirectory() as tmpdir:
                     results_path = os.path.join(tmpdir, "results.pkl")
 
                     with open(results_path, "wb") as f:
                         pickle.dump(results, f)
-                        
+
                     mlflow.log_artifact(results_path)
                     mlflow.log_params(
                         {
