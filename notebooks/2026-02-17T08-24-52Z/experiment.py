@@ -11,10 +11,12 @@ from typing import Callable, Sequence, Union
 import mlflow
 import nico2_lib as n2l
 import numpy as np
+import scanpy as sc
 from anndata.typing import AnnData
 from joblib import Memory
 from joblib.externals.loky.backend.context import os
 from nico2_lib.predictors import NmfPredictor
+from nico2_lib.predictors._scvi._scvi_pred import ScviPredictor
 from numpy import intp, number
 from numpy.typing import NDArray
 from sklearn.decomposition import PCA
@@ -123,6 +125,33 @@ def _create_spatial_loader(
     return loader
 
 
+def _create_pseudospatial_loader(
+    loader_func: Callable[[str], AnnData], ct_key: str
+) -> LoaderFn:
+    def split_loader(
+        dir: str,
+        *,
+        cached_label_transfer: bool = True,
+    ) -> tuple[AnnData, AnnData, str, str]:
+        adata = loader_func(dir)
+        n_cells = adata.n_obs
+        shuffled_idx = np.random.permutation(n_cells)
+        split_idx = n_cells // 2
+
+        idx1, idx2 = shuffled_idx[:split_idx], shuffled_idx[split_idx:]
+        query = adata[idx1].copy()
+        reference = adata[idx2].copy()
+
+        sc.pp.highly_variable_genes(
+            query, n_top_genes=500, flavor="seurat_v3", inplace=True
+        )
+        query = query[:, query.var["highly_variable"]].copy()
+
+        return query, reference, ct_key, ct_key
+
+    return split_loader
+
+
 def _adata_dense_mut(adata: AnnData) -> None:
     if hasattr(adata.X, "toarray"):
         adata.X = adata.X.toarray()  # type: ignore
@@ -163,12 +192,39 @@ def _build_dataloaders(cache_dir: str) -> list[LoaderFnWrapper]:
                 memory=Memory(cache_dir),
             ),
         ),
+        LoaderFnWrapper(
+            name="small_mouse_intestine_pseudospatial",
+            loader=_create_pseudospatial_loader(
+                n2l.dt.small_mouse_intestine_sc, ct_key="cluster"
+            ),
+        ),
+        LoaderFnWrapper(
+            name="human_liver_spatial",
+            loader=_create_spatial_loader(
+                query_loader=lambda dir: n2l.dt.xenium_10x_loader(
+                    name="Xenium_V1_hLiver_nondiseased_section_FFPE", dir=dir
+                ),
+                query_ct_key="annot",
+                reference_loader=n2l.dt.human_liver_cell_atlas,
+                reference_ct_key="annot",
+                memory=Memory(cache_dir),
+            ),
+        ),
+        LoaderFnWrapper(
+            name="human_liver_pseudospatial",
+            loader=_create_pseudospatial_loader(
+                loader_func=n2l.dt.human_liver_cell_atlas,
+                ct_key="annot",
+            ),
+        ),
     ]
 
 
 predictors: list[PredictorWrapper] = [
     PredictorWrapper("NMF_3", NmfPredictor(n_components=3)),
     PredictorWrapper("NMF_8", NmfPredictor(n_components=8)),
+    PredictorWrapper("SCVI_3", ScviPredictor(n_factors=3)),
+    PredictorWrapper("SCVI_8", ScviPredictor(n_factors=8)),
 ]
 
 
@@ -277,7 +333,9 @@ def get_model_results(
     test_indices: Union[Sequence[NDArray[intp]], NDArray[intp]],
 ) -> list[Result]:
     if len(global_predictors) != len(celltype_predictors):
-        raise ValueError("Global and celltype predictor lists must have the same length")
+        raise ValueError(
+            "Global and celltype predictor lists must have the same length"
+        )
 
     model_results: list[Result] = []
     for global_model, celltype_model in zip(global_predictors, celltype_predictors):
