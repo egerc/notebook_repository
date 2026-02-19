@@ -4,9 +4,9 @@ import json
 import logging
 import pickle
 import tempfile
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Callable, Sequence, Union
+from typing import Callable, Mapping, Sequence, TypeVar, Union
 
 import mlflow
 import nico2_lib as n2l
@@ -43,12 +43,20 @@ class Config:
     seed: int
     n_samples: int
     sample_length: int
+    dataloader_keys: list[str] = field(default_factory=list)
+    predictor_keys: list[str] = field(default_factory=list)
 
 
 @dataclass(frozen=True)
 class PredictorWrapper:
     name: str
     predictor: n2l.pd.PredictorProtocol
+
+
+@dataclass(frozen=True)
+class PredictorFactoryWrapper:
+    name: str
+    create_predictor: Callable[[], n2l.pd.PredictorProtocol]
 
 
 @dataclass(frozen=True)
@@ -180,8 +188,8 @@ def load_config(config_path: Path | None = None) -> Config:
     return Config(**raw)
 
 
-def _build_dataloaders(cache_dir: str) -> list[LoaderFnWrapper]:
-    return [
+def _build_dataloader_registry(cache_dir: str) -> dict[str, LoaderFnWrapper]:
+    registry = [
         LoaderFnWrapper(
             name="small_mouse_intestine_spatial",
             loader=_create_spatial_loader(
@@ -218,19 +226,61 @@ def _build_dataloaders(cache_dir: str) -> list[LoaderFnWrapper]:
             ),
         ),
     ]
+    return {loader.name: loader for loader in registry}
 
 
-predictors: list[PredictorWrapper] = [
-    PredictorWrapper("NMF_3", NmfPredictor(n_components=3)),
-    PredictorWrapper("NMF_8", NmfPredictor(n_components=8)),
-    PredictorWrapper("SCVI_3", ScviPredictor(n_factors=3)),
-    PredictorWrapper("SCVI_8", ScviPredictor(n_factors=8)),
-]
+def _build_predictor_registry() -> dict[str, PredictorFactoryWrapper]:
+    registry = [
+        PredictorFactoryWrapper(
+            "NMF_3", create_predictor=lambda: NmfPredictor(n_components=3)
+        ),
+        PredictorFactoryWrapper(
+            "NMF_8", create_predictor=lambda: NmfPredictor(n_components=8)
+        ),
+        PredictorFactoryWrapper(
+            "SCVI_3", create_predictor=lambda: ScviPredictor(n_factors=3)
+        ),
+        PredictorFactoryWrapper(
+            "SCVI_8", create_predictor=lambda: ScviPredictor(n_factors=8)
+        ),
+    ]
+    return {predictor.name: predictor for predictor in registry}
+
+
+RegistryT = TypeVar("RegistryT")
+
+
+def _select_registry_entries(
+    registry: Mapping[str, RegistryT],
+    selected_keys: Sequence[str],
+    *,
+    entry_type: str,
+) -> list[RegistryT]:
+    keys = list(registry.keys()) if len(selected_keys) == 0 else list(selected_keys)
+    unknown_keys = [key for key in keys if key not in registry]
+    if unknown_keys:
+        available = ", ".join(sorted(registry.keys()))
+        raise ValueError(
+            f"Unknown {entry_type} key(s): {', '.join(unknown_keys)}. "
+            f"Available keys: {available}"
+        )
+    return [registry[key] for key in keys]
 
 
 def run_experiment(config: Config) -> list[ExperimentOutput]:
     experiment_outputs: list[ExperimentOutput] = []
-    dataloaders = _build_dataloaders(config.cache_dir)
+    dataloader_registry = _build_dataloader_registry(config.cache_dir)
+    dataloaders = _select_registry_entries(
+        dataloader_registry,
+        config.dataloader_keys,
+        entry_type="dataloader",
+    )
+    predictor_registry = _build_predictor_registry()
+    predictor_factories = _select_registry_entries(
+        predictor_registry,
+        config.predictor_keys,
+        entry_type="predictor",
+    )
     for dataloader in dataloaders:
         query, reference, query_ct_key, reference_ct_key = dataloader.loader(
             config.data_dir
@@ -249,6 +299,7 @@ def run_experiment(config: Config) -> list[ExperimentOutput]:
                     seed=config.seed,
                     n_samples=config.n_samples,
                     sample_length=config.sample_length,
+                    predictor_factories=predictor_factories,
                 ),
             )
         )
@@ -264,6 +315,7 @@ def get_celltype_results(
     seed: int,
     n_samples: int,
     sample_length: int,
+    predictor_factories: Sequence[PredictorFactoryWrapper],
 ) -> list[CelltypeResult]:
     query_celltypes = _filter_celltypes(query, query_ct_key, n_pca_components)
     reference_celltypes = _filter_celltypes(
@@ -283,10 +335,10 @@ def get_celltype_results(
     )
     global_models = [
         PredictorWrapper(
-            name=predictor_wrapper.name,
-            predictor=predictor_wrapper.predictor.fit(reference_shared.X),  # type: ignore
+            name=predictor_factory.name,
+            predictor=predictor_factory.create_predictor().fit(reference_shared.X),  # type: ignore
         )
-        for predictor_wrapper in predictors
+        for predictor_factory in predictor_factories
     ]
     results: list[CelltypeResult] = []
     for celltype in shared_celltypes:
@@ -298,12 +350,12 @@ def get_celltype_results(
         umap_embeddings = UMAP(n_components=2).fit_transform(pca_embeddings)
         celltype_models = [
             PredictorWrapper(
-                name=predictor_wrapper.name,
-                predictor=predictor_wrapper.predictor.fit(
+                name=predictor_factory.name,
+                predictor=predictor_factory.create_predictor().fit(
                     reference_shared[reference_celltype_mask].X  # type: ignore
                 ),
             )
-            for predictor_wrapper in predictors
+            for predictor_factory in predictor_factories
         ]
         observed_counts = query_shared[query_celltype_mask].X  # type: ignore
         results.append(
