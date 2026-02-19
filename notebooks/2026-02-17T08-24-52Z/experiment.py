@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import logging
 import pickle
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Sequence, Union
@@ -319,12 +320,13 @@ def main() -> None:
     with mlflow.start_run():
         mlflow.log_params(config.__dict__)
         experiment_outputs = run_experiment(config)
-        artifact_name = "results.pkl"
-        artifact_path = os.path.join("artifacts", artifact_name)
-        os.makedirs(os.path.dirname(artifact_path), exist_ok=True)
-        with open(artifact_path, "wb") as f:
-            pickle.dump(experiment_outputs, f)
-        mlflow.log_artifact(artifact_path)
+        with tempfile.TemporaryDirectory() as tmpdir:
+            artifact_name = "results.pkl"
+            artifact_path = os.path.join(tmpdir, artifact_name)
+            os.makedirs(os.path.dirname(artifact_path), exist_ok=True)
+            with open(artifact_path, "wb") as f:
+                pickle.dump(experiment_outputs, f)
+                mlflow.log_artifact(artifact_path)
 
 
 if __name__ == "__main__":
