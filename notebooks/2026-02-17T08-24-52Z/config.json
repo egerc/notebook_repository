@@ -4,7 +4,5 @@
   "seed": 0,
   "n_samples": 10,
   "sample_length": 20,
-  "n_pca_components": 25,
-  "mlflow_experiment_name": "explainability_benchmark",
-  "mlflow_parent_run_name": "dataset_predictor_sweep"
+  "n_pca_components": 25
 }
