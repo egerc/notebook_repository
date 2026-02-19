@@ -68,13 +68,13 @@ class CelltypeResult:
     pca_embedding: NumericArray
     umap_embedding: NumericArray
     observed_counts: NumericArray
-    global_model_results: list[Result]
-    celltype_model_results: list[Result]
+    model_results: list[Result]
 
 
 @dataclass(frozen=True)
 class Result:
-    model: PredictorWrapper
+    global_model: PredictorWrapper
+    celltype_model: PredictorWrapper
     sample_results: list[SampleResult]
 
 
@@ -83,8 +83,10 @@ class SampleResult:
     sample_idx: int
     train_idx: Union[Sequence[int], NDArray[np.intp]]
     test_idx: Union[Sequence[int], NDArray[np.intp]]
-    embedding: NumericArray
-    predicted_counts: NumericArray
+    global_model_embedding: NumericArray
+    global_model_predicted_counts: NumericArray
+    celltype_model_embedding: NumericArray
+    celltype_model_predicted_counts: NumericArray
 
 
 def _create_spatial_loader(
@@ -255,13 +257,8 @@ def get_celltype_results(
                 pca_embedding=pca_embeddings,
                 umap_embedding=umap_embeddings,  # type: ignore
                 observed_counts=observed_counts,  # type: ignore
-                global_model_results=get_model_results(
+                model_results=get_model_results(
                     global_models,
-                    counts=observed_counts,  # type: ignore
-                    train_indices=train_indices,
-                    test_indices=test_indices,
-                ),
-                celltype_model_results=get_model_results(
                     celltype_models,
                     counts=observed_counts,  # type: ignore
                     train_indices=train_indices,
@@ -273,18 +270,24 @@ def get_celltype_results(
 
 
 def get_model_results(
-    predictors: Sequence[PredictorWrapper],
+    global_predictors: Sequence[PredictorWrapper],
+    celltype_predictors: Sequence[PredictorWrapper],
     counts: NumericArray,
     train_indices: Union[Sequence[NDArray[intp]], NDArray[intp]],
     test_indices: Union[Sequence[NDArray[intp]], NDArray[intp]],
 ) -> list[Result]:
+    if len(global_predictors) != len(celltype_predictors):
+        raise ValueError("Global and celltype predictor lists must have the same length")
+
     model_results: list[Result] = []
-    for model in predictors:
+    for global_model, celltype_model in zip(global_predictors, celltype_predictors):
         model_results.append(
             Result(
-                model=model,
+                global_model=global_model,
+                celltype_model=celltype_model,
                 sample_results=get_sample_results(
-                    predictor=model.predictor,
+                    global_predictor=global_model.predictor,
+                    celltype_predictor=celltype_model.predictor,
                     counts=counts,
                     train_indices=train_indices,
                     test_indices=test_indices,
@@ -295,21 +298,29 @@ def get_model_results(
 
 
 def get_sample_results(
-    predictor: n2l.pd.PredictorProtocol,
+    global_predictor: n2l.pd.PredictorProtocol,
+    celltype_predictor: n2l.pd.PredictorProtocol,
     counts: NumericArray,
     train_indices: Union[Sequence[NDArray[intp]], NDArray[intp]],
     test_indices: Union[Sequence[NDArray[intp]], NDArray[intp]],
 ) -> list[SampleResult]:
     sample_results: list[SampleResult] = []
     for idx, (train_idx, test_idx) in enumerate(zip(train_indices, test_indices)):
-        embedding, predicted_counts = predictor.predict(counts[:, train_idx], train_idx)
+        global_embedding, global_predicted_counts = global_predictor.predict(
+            counts[:, train_idx], train_idx
+        )
+        celltype_embedding, celltype_predicted_counts = celltype_predictor.predict(
+            counts[:, train_idx], train_idx
+        )
         sample_results.append(
             SampleResult(
                 sample_idx=idx,
                 train_idx=train_idx,
                 test_idx=test_idx,
-                embedding=embedding,
-                predicted_counts=predicted_counts,
+                global_model_embedding=global_embedding,
+                global_model_predicted_counts=global_predicted_counts,
+                celltype_model_embedding=celltype_embedding,
+                celltype_model_predicted_counts=celltype_predicted_counts,
             )
         )
     return sample_results
