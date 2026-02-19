@@ -3,20 +3,18 @@ from __future__ import annotations
 import json
 import logging
 import pickle
-import tempfile
-from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable
+from typing import Callable, Sequence, Union
 
 import mlflow
 import nico2_lib as n2l
 import numpy as np
 from anndata.typing import AnnData
 from joblib import Memory
-from joblib.func_inspect import os
+from joblib.externals.loky.backend.context import os
 from nico2_lib.predictors import NmfPredictor
-from numpy import number
+from numpy import intp, number
 from numpy.typing import NDArray
 from sklearn.decomposition import PCA
 from sklearn.preprocessing import StandardScaler
@@ -32,6 +30,60 @@ logger = logging.getLogger(__name__)
 
 NumericArray = NDArray[number]
 LoaderFn = Callable[[str], tuple[AnnData, AnnData, str, str]]
+
+
+@dataclass(frozen=True)
+class Config:
+    data_dir: str
+    cache_dir: str
+    n_pca_components: int
+    seed: int
+    n_samples: int
+    sample_length: int
+
+
+@dataclass(frozen=True)
+class PredictorWrapper:
+    name: str
+    predictor: n2l.pd.PredictorProtocol
+
+
+@dataclass(frozen=True)
+class LoaderFnWrapper:
+    name: str
+    loader: LoaderFn
+
+
+@dataclass(frozen=True)
+class ExperimentOutput:
+    dataset_name: str
+    celltype_results: list[CelltypeResult]
+
+
+@dataclass(frozen=True)
+class CelltypeResult:
+    celltype: str
+    celltype_mask: NDArray[np.bool_]
+    pca_embedding: NumericArray
+    umap_embedding: NumericArray
+    observed_counts: NumericArray
+    global_model_results: list[Result]
+    celltype_model_results: list[Result]
+
+
+@dataclass(frozen=True)
+class Result:
+    model: PredictorWrapper
+    sample_results: list[SampleResult]
+
+
+@dataclass(frozen=True)
+class SampleResult:
+    sample_idx: int
+    train_idx: Union[Sequence[int], NDArray[np.intp]]
+    test_idx: Union[Sequence[int], NDArray[np.intp]]
+    embedding: NumericArray
+    predicted_counts: NumericArray
 
 
 def _create_spatial_loader(
@@ -89,68 +141,6 @@ def _filter_celltypes(adata: AnnData, ct_key: str, min_count: int) -> list[str]:
     return celltypes[celltypes >= min_count].index.tolist()  # type: ignore
 
 
-@dataclass(frozen=True)
-class PredictorWrapper:
-    name: str
-    predictor: n2l.pd.PredictorProtocol
-
-
-@dataclass(frozen=True)
-class LoaderFnWrapper:
-    name: str
-    loader: LoaderFn
-
-
-@dataclass(frozen=True)
-class Config:
-    data_dir: str
-    cache_dir: str
-    seed: int
-    n_samples: int
-    sample_length: int
-    n_pca_components: int
-    mlflow_experiment_name: str
-    mlflow_parent_run_name: str
-
-
-@dataclass(frozen=True)
-class Models:
-    name: str
-    model: n2l.pd.PredictorProtocol
-    
-@dataclass(frozen=True)
-class DatasetResult:
-    name: str
-    global_models: list[Models]
-
-@dataclass(frozen=True)
-class CelltypeResults:
-    pass
-
-@dataclass(frozen=True)
-class SampleResult:
-    sample_idx: int
-    train_idx: NDArray[np.int_]
-    test_idx: NDArray[np.int_]
-    observed_counts: NumericArray
-    global_model_predicted_counts: NumericArray
-    global_model_embeddings: NumericArray
-    celltype_model_predicted_counts: NumericArray
-    celltype_model_embeddings: NumericArray
-
-
-@dataclass(frozen=True)
-class CelltypeResult:
-    celltype: str
-    celltype_pca_embedding: NumericArray
-    celltype_umap_embedding: NumericArray
-    global_model: n2l.pd.PredictorProtocol
-    global_model_embedding_size: int
-    celltype_model: n2l.pd.PredictorProtocol
-    celltype_model_embedding_size: int
-    samples: Sequence[SampleResult]
-
-
 def load_config(config_path: Path | None = None) -> Config:
     path = config_path or Path(__file__).with_name("config.json")
     with path.open() as f:
@@ -179,147 +169,162 @@ predictors: list[PredictorWrapper] = [
 ]
 
 
+def run_experiment(config: Config) -> list[ExperimentOutput]:
+    experiment_outputs: list[ExperimentOutput] = []
+    dataloaders = _build_dataloaders(config.cache_dir)
+    for dataloader in dataloaders:
+        query, reference, query_ct_key, reference_ct_key = dataloader.loader(
+            config.data_dir
+        )
+        _adata_dense_mut(query)
+        _adata_dense_mut(reference)
+        experiment_outputs.append(
+            ExperimentOutput(
+                dataset_name=dataloader.name,
+                celltype_results=get_celltype_results(
+                    query=query,
+                    reference=reference,
+                    query_ct_key=query_ct_key,
+                    reference_ct_key=reference_ct_key,
+                    n_pca_components=config.n_pca_components,
+                    seed=config.seed,
+                    n_samples=config.n_samples,
+                    sample_length=config.sample_length,
+                ),
+            )
+        )
+    return experiment_outputs
+
+
+def get_celltype_results(
+    query: AnnData,
+    reference: AnnData,
+    query_ct_key: str,
+    reference_ct_key: str,
+    n_pca_components: int,
+    seed: int,
+    n_samples: int,
+    sample_length: int,
+) -> list[CelltypeResult]:
+    query_celltypes = _filter_celltypes(query, query_ct_key, n_pca_components)
+    reference_celltypes = _filter_celltypes(
+        reference, reference_ct_key, n_pca_components
+    )
+    shared_celltypes = np.sort(np.intersect1d(query_celltypes, reference_celltypes))
+    shared_features = np.intersect1d(query.var_names, reference.var_names)
+
+    query_mask = query.obs[query_ct_key].isin(shared_celltypes.tolist())
+    reference_mask = reference.obs[reference_ct_key].isin(shared_celltypes.tolist())
+    query_shared = query[query_mask, shared_features]
+    reference_shared = reference[reference_mask, shared_features]
+    n_features = shared_features.shape[0]
+    rng = np.random.default_rng(seed)
+    train_indices, test_indices = _sample_indices(
+        n_features, n_samples, sample_length, rng
+    )
+    global_models = [
+        PredictorWrapper(
+            name=predictor_wrapper.name,
+            predictor=predictor_wrapper.predictor.fit(reference_shared.X),  # type: ignore
+        )
+        for predictor_wrapper in predictors
+    ]
+    results: list[CelltypeResult] = []
+    for celltype in shared_celltypes:
+        query_celltype_mask = query_shared.obs[query_ct_key] == celltype
+        reference_celltype_mask = reference_shared.obs[reference_ct_key] == celltype
+        pca_embeddings = PCA(n_components=n_pca_components).fit_transform(
+            StandardScaler().fit_transform(query_shared[query_celltype_mask].X)
+        )
+        umap_embeddings = UMAP(n_components=2).fit_transform(pca_embeddings)
+        celltype_models = [
+            PredictorWrapper(
+                name=predictor_wrapper.name,
+                predictor=predictor_wrapper.predictor.fit(
+                    reference_shared[reference_celltype_mask].X  # type: ignore
+                ),
+            )
+            for predictor_wrapper in predictors
+        ]
+        observed_counts = query_shared[query_celltype_mask].X  # type: ignore
+        results.append(
+            CelltypeResult(
+                celltype=celltype,
+                celltype_mask=query_celltype_mask,
+                pca_embedding=pca_embeddings,
+                umap_embedding=umap_embeddings,  # type: ignore
+                observed_counts=observed_counts,  # type: ignore
+                global_model_results=get_model_results(
+                    global_models,
+                    counts=observed_counts,  # type: ignore
+                    train_indices=train_indices,
+                    test_indices=test_indices,
+                ),
+                celltype_model_results=get_model_results(
+                    celltype_models,
+                    counts=observed_counts,  # type: ignore
+                    train_indices=train_indices,
+                    test_indices=test_indices,
+                ),
+            )
+        )
+    return results
+
+
+def get_model_results(
+    predictors: Sequence[PredictorWrapper],
+    counts: NumericArray,
+    train_indices: Union[Sequence[NDArray[intp]], NDArray[intp]],
+    test_indices: Union[Sequence[NDArray[intp]], NDArray[intp]],
+) -> list[Result]:
+    model_results: list[Result] = []
+    for model in predictors:
+        model_results.append(
+            Result(
+                model=model,
+                sample_results=get_sample_results(
+                    predictor=model.predictor,
+                    counts=counts,
+                    train_indices=train_indices,
+                    test_indices=test_indices,
+                ),
+            )
+        )
+    return model_results
+
+
+def get_sample_results(
+    predictor: n2l.pd.PredictorProtocol,
+    counts: NumericArray,
+    train_indices: Union[Sequence[NDArray[intp]], NDArray[intp]],
+    test_indices: Union[Sequence[NDArray[intp]], NDArray[intp]],
+) -> list[SampleResult]:
+    sample_results: list[SampleResult] = []
+    for idx, (train_idx, test_idx) in enumerate(zip(train_indices, test_indices)):
+        embedding, predicted_counts = predictor.predict(counts[:, train_idx], train_idx)
+        sample_results.append(
+            SampleResult(
+                sample_idx=idx,
+                train_idx=train_idx,
+                test_idx=test_idx,
+                embedding=embedding,
+                predicted_counts=predicted_counts,
+            )
+        )
+    return sample_results
+
+
 def main() -> None:
     config = load_config()
-    dataloaders = _build_dataloaders(config.cache_dir)
-    mlflow.set_experiment(config.mlflow_experiment_name)
-    with mlflow.start_run(run_name=config.mlflow_parent_run_name):
+    with mlflow.start_run():
         mlflow.log_params(config.__dict__)
-        mlflow.log_params(
-            {
-                "predictor_names": [p.name for p in predictors],
-                "dataloader_names": [d.name for d in dataloaders],
-            }
-        )
-        for dataloader in dataloaders:
-            query, reference, query_ct_key, reference_ct_key = dataloader.loader(
-                config.data_dir
-            )
-            _adata_dense_mut(query)
-            _adata_dense_mut(reference)
-
-            query_celltypes = _filter_celltypes(
-                query, query_ct_key, config.n_pca_components
-            )
-            reference_celltypes = _filter_celltypes(
-                reference, reference_ct_key, config.n_pca_components
-            )
-            shared_celltypes = np.sort(
-                np.intersect1d(query_celltypes, reference_celltypes)
-            )
-            shared_features = np.intersect1d(query.var_names, reference.var_names)
-
-            query_mask = query.obs[query_ct_key].isin(shared_celltypes.tolist())
-            reference_mask = reference.obs[reference_ct_key].isin(
-                shared_celltypes.tolist()
-            )
-            query_shared = query[query_mask, shared_features]
-            reference_shared = reference[reference_mask, shared_features]
-
-            n_features = shared_features.shape[0]
-            rng = np.random.default_rng(config.seed)
-            train_idxs, test_idxs = _sample_indices(
-                n_features, config.n_samples, config.sample_length, rng
-            )
-
-            celltype_pca_embeddings: dict[str, NumericArray] = {}
-            celltype_umap_embeddings: dict[str, NumericArray] = {}
-            for celltype in shared_celltypes:
-                query_celltype_mask = query_shared.obs[query_ct_key] == celltype
-                celltype_pca_embeddings[celltype] = PCA(
-                    n_components=config.n_pca_components
-                ).fit_transform(
-                    StandardScaler().fit_transform(query_shared[query_celltype_mask].X)
-                )  # type: ignore
-                celltype_umap_embeddings[celltype] = UMAP(n_components=2).fit_transform(
-                    celltype_pca_embeddings[celltype]
-                )
-
-            for predictor in predictors:
-                with mlflow.start_run(
-                    nested=True, run_name=f"{predictor.name}_{dataloader.name}"
-                ):
-                    celltype_results: list[CelltypeResult] = []
-                    global_model = predictor.predictor.fit(reference_shared.X)  # type: ignore
-                    for celltype in shared_celltypes:
-                        query_celltype_mask = query_shared.obs[query_ct_key] == celltype
-                        reference_celltype_mask = (
-                            reference_shared.obs[reference_ct_key] == celltype
-                        )
-                        celltype_model = predictor.predictor.fit(
-                            reference_shared[reference_celltype_mask].X  # type: ignore
-                        )
-                        sample_results: list[SampleResult] = []
-                        for idx, (train_idx, test_idx) in enumerate(
-                            zip(train_idxs, test_idxs)
-                        ):
-                            observed_counts = query_shared[
-                                query_celltype_mask, test_idx
-                            ].X  # type: ignore
-                            global_model_embeddings, global_model_predicted_counts = (
-                                global_model.predict(
-                                    query_shared[query_celltype_mask, train_idx].X,  # type: ignore
-                                    train_idx,
-                                )
-                            )
-                            (
-                                celltype_model_embeddings,
-                                celltype_model_predicted_counts,
-                            ) = celltype_model.predict(
-                                query_shared[query_celltype_mask, train_idx].X,  # type: ignore
-                                train_idx,
-                            )
-                            sample_results.append(
-                                SampleResult(
-                                    sample_idx=idx,
-                                    train_idx=train_idx,
-                                    test_idx=test_idx,
-                                    observed_counts=observed_counts,  # type: ignore
-                                    global_model_predicted_counts=global_model_predicted_counts[
-                                        :, test_idx
-                                    ],
-                                    global_model_embeddings=global_model_embeddings,
-                                    celltype_model_predicted_counts=celltype_model_predicted_counts[
-                                        :, test_idx
-                                    ],
-                                    celltype_model_embeddings=celltype_model_embeddings,
-                                )
-                            )
-
-                        celltype_results.append(
-                            CelltypeResult(
-                                celltype=celltype,
-                                celltype_pca_embedding=celltype_pca_embeddings[
-                                    celltype
-                                ],
-                                celltype_umap_embedding=celltype_umap_embeddings[
-                                    celltype
-                                ],  # type: ignore
-                                global_model=global_model,
-                                global_model_embedding_size=global_model_embeddings.shape[
-                                    1
-                                ],
-                                celltype_model=celltype_model,
-                                celltype_model_embedding_size=celltype_model_embeddings.shape[
-                                    1
-                                ],
-                                samples=sample_results,
-                            )
-                        )
-
-                    with tempfile.TemporaryDirectory() as tmpdir:
-                        results_path = os.path.join(tmpdir, "results.pkl")
-
-                        with open(results_path, "wb") as f:
-                            pickle.dump(celltype_results, f)
-
-                        mlflow.log_artifact(results_path)
-                        mlflow.log_params(
-                            {
-                                "dataset": dataloader.name,
-                                "predictor": predictor.name,
-                            }
-                        )
+        experiment_outputs = run_experiment(config)
+        artifact_name = "results.pkl"
+        artifact_path = os.path.join("artifacts", artifact_name)
+        os.makedirs(os.path.dirname(artifact_path), exist_ok=True)
+        with open(artifact_path, "wb") as f:
+            pickle.dump(experiment_outputs, f)
+        mlflow.log_artifact(artifact_path)
 
 
 if __name__ == "__main__":
