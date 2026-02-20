@@ -67,7 +67,7 @@ class LoaderFnWrapper:
 
 @dataclass(frozen=True)
 class ExperimentResult:
-    dataset_name: str
+    datasets: list[DatasetDimension]
     celltypes: list[CelltypeDimension]
     samples: list[SampleDimension]
     models: list[ModelDimension]
@@ -75,7 +75,14 @@ class ExperimentResult:
 
 
 @dataclass(frozen=True)
+class DatasetDimension:
+    dataset_id: int
+    dataset_name: str
+
+
+@dataclass(frozen=True)
 class CelltypeDimension:
+    dataset_id: int
     celltype_id: int
     celltype: str
     celltype_mask: NDArray[np.bool_]
@@ -86,6 +93,7 @@ class CelltypeDimension:
 
 @dataclass(frozen=True)
 class SampleDimension:
+    dataset_id: int
     sample_id: int
     train_idx: Union[Sequence[int], NDArray[np.intp]]
     test_idx: Union[Sequence[int], NDArray[np.intp]]
@@ -93,12 +101,14 @@ class SampleDimension:
 
 @dataclass(frozen=True)
 class ModelDimension:
+    dataset_id: int
     model_id: int
     model_name: str
 
 
 @dataclass(frozen=True)
 class ResultRecord:
+    dataset_id: int
     sample_id: int
     model_id: int
     celltype_id: int
@@ -284,8 +294,12 @@ def _select_registry_entries(
     return [registry[key] for key in keys]
 
 
-def run_experiment(config: Config) -> list[ExperimentResult]:
-    experiment_results: list[ExperimentResult] = []
+def run_experiment(config: Config) -> ExperimentResult:
+    dataset_dimensions: list[DatasetDimension] = []
+    celltype_dimensions: list[CelltypeDimension] = []
+    sample_dimensions: list[SampleDimension] = []
+    model_dimensions: list[ModelDimension] = []
+    result_records: list[ResultRecord] = []
     dataloader_registry = _build_dataloader_registry(config.cache_dir)
     dataloaders = _select_registry_entries(
         dataloader_registry,
@@ -298,13 +312,14 @@ def run_experiment(config: Config) -> list[ExperimentResult]:
         config.predictor_keys,
         entry_type="predictor",
     )
-    for dataloader in dataloaders:
+    for dataset_id, dataloader in enumerate(dataloaders):
         query, reference, query_ct_key, reference_ct_key = dataloader.loader(
             config.data_dir
         )
         _adata_dense_mut(query)
         _adata_dense_mut(reference)
         celltypes, samples, models, results = get_relational_results(
+            dataset_id=dataset_id,
             query=query,
             reference=reference,
             query_ct_key=query_ct_key,
@@ -315,19 +330,24 @@ def run_experiment(config: Config) -> list[ExperimentResult]:
             sample_length=config.sample_length,
             predictor_factories=predictor_factories,
         )
-        experiment_results.append(
-            ExperimentResult(
-                dataset_name=dataloader.name,
-                celltypes=celltypes,
-                samples=samples,
-                models=models,
-                results=results,
-            )
+        dataset_dimensions.append(
+            DatasetDimension(dataset_id=dataset_id, dataset_name=dataloader.name)
         )
-    return experiment_results
+        celltype_dimensions.extend(celltypes)
+        sample_dimensions.extend(samples)
+        model_dimensions.extend(models)
+        result_records.extend(results)
+    return ExperimentResult(
+        datasets=dataset_dimensions,
+        celltypes=celltype_dimensions,
+        samples=sample_dimensions,
+        models=model_dimensions,
+        results=result_records,
+    )
 
 
 def get_relational_results(
+    dataset_id: int,
     query: AnnData,
     reference: AnnData,
     query_ct_key: str,
@@ -360,7 +380,11 @@ def get_relational_results(
         n_features, n_samples, sample_length, rng
     )
     model_dimensions = [
-        ModelDimension(model_id=model_id, model_name=predictor_factory.name)
+        ModelDimension(
+            dataset_id=dataset_id,
+            model_id=model_id,
+            model_name=predictor_factory.name,
+        )
         for model_id, predictor_factory in enumerate(predictor_factories)
     ]
     global_models_by_id = {
@@ -384,6 +408,7 @@ def get_relational_results(
         )
         umap_embedding = UMAP(n_components=2).fit_transform(pca_embedding)
         dimension = CelltypeDimension(
+            dataset_id=dataset_id,
             celltype_id=celltype_id,
             celltype=str(celltype),
             celltype_mask=query_celltype_mask,
@@ -414,7 +439,12 @@ def get_relational_results(
     result_records: list[ResultRecord] = []
     for sample_id, (train_idx, test_idx) in enumerate(zip(train_indices, test_indices)):
         sample_dimensions.append(
-            SampleDimension(sample_id=sample_id, train_idx=train_idx, test_idx=test_idx)
+            SampleDimension(
+                dataset_id=dataset_id,
+                sample_id=sample_id,
+                train_idx=train_idx,
+                test_idx=test_idx,
+            )
         )
         for model_id, global_model in global_models_by_id.items():
             for prepared_celltype in prepared_celltypes:
@@ -434,6 +464,7 @@ def get_relational_results(
                 observed_test_counts = observed_counts[:, test_idx]
                 result_records.append(
                     ResultRecord(
+                        dataset_id=dataset_id,
                         sample_id=sample_id,
                         model_id=model_id,
                         celltype_id=prepared_celltype.dimension.celltype_id,
@@ -457,13 +488,13 @@ def main() -> None:
     config = load_config()
     with mlflow.start_run():
         mlflow.log_params(config.__dict__)
-        experiment_results = run_experiment(config)
+        experiment_result = run_experiment(config)
         with tempfile.TemporaryDirectory() as tmpdir:
             artifact_name = "results.pkl"
             artifact_path = os.path.join(tmpdir, artifact_name)
             os.makedirs(os.path.dirname(artifact_path), exist_ok=True)
             with open(artifact_path, "wb") as f:
-                pickle.dump(experiment_results, f)
+                pickle.dump(experiment_result, f)
                 mlflow.log_artifact(artifact_path)
 
 
