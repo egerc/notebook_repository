@@ -1,0 +1,11 @@
+data_dir: ../data
+cache_dir: ../cache
+seed: 0
+n_samples: 10
+sample_length: 20
+n_pca_components: 10
+dataloader_keys: # possible dataloaders: small_mouse_intestine_spatial, small_mouse_intestinal_pseudospatial, human_liver_spatial, human_liver_pseudospatial
+  - small_mouse_intestine_spatial
+predictor_keys: # possible predictors: NMF_3, NMF_8
+  - NMF_3
+  - NMF_8

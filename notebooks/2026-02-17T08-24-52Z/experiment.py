@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import json
 import logging
 import pickle
 import tempfile
@@ -12,12 +11,13 @@ import mlflow
 import nico2_lib as n2l
 import numpy as np
 import scanpy as sc
+import yaml
 from anndata.typing import AnnData
 from joblib import Memory
 from joblib.externals.loky.backend.context import os
 from nico2_lib.predictors import NmfPredictor
 from nico2_lib.predictors._scvi._scvi_pred import ScviPredictor
-from numpy import intp, number
+from numpy import number
 from numpy.typing import NDArray
 from sklearn.decomposition import PCA
 from sklearn.preprocessing import StandardScaler
@@ -68,35 +68,48 @@ class LoaderFnWrapper:
 @dataclass(frozen=True)
 class ExperimentOutput:
     dataset_name: str
-    celltype_results: list[CelltypeResult]
+    celltype_metadata: list[CelltypeMetadata]
+    split_results: list[SplitResult]
 
 
 @dataclass(frozen=True)
-class CelltypeResult:
+class CelltypeMetadata:
     celltype: str
     celltype_mask: NDArray[np.bool_]
     pca_embedding: NumericArray
     umap_embedding: NumericArray
     observed_counts: NumericArray
-    model_results: list[Result]
 
 
 @dataclass(frozen=True)
-class Result:
-    global_model: PredictorWrapper
-    celltype_model: PredictorWrapper
-    sample_results: list[SampleResult]
-
-
-@dataclass(frozen=True)
-class SampleResult:
+class SplitResult:
     sample_idx: int
     train_idx: Union[Sequence[int], NDArray[np.intp]]
     test_idx: Union[Sequence[int], NDArray[np.intp]]
+    model_results: list[ModelSplitResult]
+
+
+@dataclass(frozen=True)
+class ModelSplitResult:
+    model_name: str
+    celltype_results: list[CelltypeSplitResult]
+
+
+@dataclass(frozen=True)
+class CelltypeSplitResult:
+    celltype: str
+    n_cells: int
+    observed_test_counts: NumericArray
     global_model_embedding: NumericArray
-    global_model_predicted_counts: NumericArray
+    global_model_predicted_test_counts: NumericArray
     celltype_model_embedding: NumericArray
-    celltype_model_predicted_counts: NumericArray
+    celltype_model_predicted_test_counts: NumericArray
+
+
+@dataclass(frozen=True)
+class _PreparedCelltype:
+    metadata: CelltypeMetadata
+    celltype_models_by_name: dict[str, PredictorWrapper]
 
 
 def _create_spatial_loader(
@@ -172,7 +185,7 @@ def _sample_indices(
     rng: np.random.Generator,
 ) -> tuple[NDArray[np.int_], NDArray[np.int_]]:
     indices = np.vstack([rng.permutation(total_features) for _ in range(n_samples)])
-    train_idx, test_idx = np.split(indices, [sample_size], axis=1)
+    test_idx, train_idx = np.split(indices, [sample_size], axis=1)
     return train_idx, test_idx
 
 
@@ -182,9 +195,9 @@ def _filter_celltypes(adata: AnnData, ct_key: str, min_count: int) -> list[str]:
 
 
 def load_config(config_path: Path | None = None) -> Config:
-    path = config_path or Path(__file__).with_name("config.json")
+    path = config_path or Path(__file__).with_name("config.yaml")
     with path.open() as f:
-        raw = json.load(f)
+        raw = yaml.safe_load(f)
     return Config(**raw)
 
 
@@ -287,26 +300,28 @@ def run_experiment(config: Config) -> list[ExperimentOutput]:
         )
         _adata_dense_mut(query)
         _adata_dense_mut(reference)
+        celltype_metadata, split_results = get_split_results(
+            query=query,
+            reference=reference,
+            query_ct_key=query_ct_key,
+            reference_ct_key=reference_ct_key,
+            n_pca_components=config.n_pca_components,
+            seed=config.seed,
+            n_samples=config.n_samples,
+            sample_length=config.sample_length,
+            predictor_factories=predictor_factories,
+        )
         experiment_outputs.append(
             ExperimentOutput(
                 dataset_name=dataloader.name,
-                celltype_results=get_celltype_results(
-                    query=query,
-                    reference=reference,
-                    query_ct_key=query_ct_key,
-                    reference_ct_key=reference_ct_key,
-                    n_pca_components=config.n_pca_components,
-                    seed=config.seed,
-                    n_samples=config.n_samples,
-                    sample_length=config.sample_length,
-                    predictor_factories=predictor_factories,
-                ),
+                celltype_metadata=celltype_metadata,
+                split_results=split_results,
             )
         )
     return experiment_outputs
 
 
-def get_celltype_results(
+def get_split_results(
     query: AnnData,
     reference: AnnData,
     query_ct_key: str,
@@ -316,7 +331,7 @@ def get_celltype_results(
     n_samples: int,
     sample_length: int,
     predictor_factories: Sequence[PredictorFactoryWrapper],
-) -> list[CelltypeResult]:
+) -> tuple[list[CelltypeMetadata], list[SplitResult]]:
     query_celltypes = _filter_celltypes(query, query_ct_key, n_pca_components)
     reference_celltypes = _filter_celltypes(
         reference, reference_ct_key, n_pca_components
@@ -333,107 +348,100 @@ def get_celltype_results(
     train_indices, test_indices = _sample_indices(
         n_features, n_samples, sample_length, rng
     )
-    global_models = [
-        PredictorWrapper(
+
+    global_models_by_name = {
+        predictor_factory.name: PredictorWrapper(
             name=predictor_factory.name,
-            predictor=predictor_factory.create_predictor().fit(reference_shared.X),  # type: ignore
+            predictor=predictor_factory.create_predictor().fit(reference_shared.X),  # type: ignore[arg-type]
         )
         for predictor_factory in predictor_factories
-    ]
-    results: list[CelltypeResult] = []
+    }
+
+    prepared_celltypes: list[_PreparedCelltype] = []
+    celltype_metadata: list[CelltypeMetadata] = []
     for celltype in shared_celltypes:
         query_celltype_mask = query_shared.obs[query_ct_key] == celltype
         reference_celltype_mask = reference_shared.obs[reference_ct_key] == celltype
-        pca_embeddings = PCA(n_components=n_pca_components).fit_transform(
+        observed_counts = np.asarray(query_shared[query_celltype_mask].X)  # type: ignore[arg-type]
+        pca_embedding = PCA(n_components=n_pca_components).fit_transform(
             StandardScaler().fit_transform(query_shared[query_celltype_mask].X)
         )
-        umap_embeddings = UMAP(n_components=2).fit_transform(pca_embeddings)
-        celltype_models = [
-            PredictorWrapper(
+        umap_embedding = UMAP(n_components=2).fit_transform(pca_embedding)
+        metadata = CelltypeMetadata(
+            celltype=str(celltype),
+            celltype_mask=query_celltype_mask,
+            pca_embedding=pca_embedding,
+            umap_embedding=umap_embedding,  # type: ignore[arg-type]
+            observed_counts=observed_counts,
+        )
+        celltype_metadata.append(metadata)
+        celltype_models_by_name = {
+            predictor_factory.name: PredictorWrapper(
                 name=predictor_factory.name,
                 predictor=predictor_factory.create_predictor().fit(
                     reference_shared[reference_celltype_mask].X  # type: ignore
                 ),
             )
             for predictor_factory in predictor_factories
-        ]
-        observed_counts = query_shared[query_celltype_mask].X  # type: ignore
-        results.append(
-            CelltypeResult(
-                celltype=celltype,
-                celltype_mask=query_celltype_mask,
-                pca_embedding=pca_embeddings,
-                umap_embedding=umap_embeddings,  # type: ignore
-                observed_counts=observed_counts,  # type: ignore
-                model_results=get_model_results(
-                    global_models,
-                    celltype_models,
-                    counts=observed_counts,  # type: ignore
-                    train_indices=train_indices,
-                    test_indices=test_indices,
-                ),
+        }
+        prepared_celltypes.append(
+            _PreparedCelltype(
+                metadata=metadata,
+                celltype_models_by_name=celltype_models_by_name,
             )
         )
-    return results
 
-
-def get_model_results(
-    global_predictors: Sequence[PredictorWrapper],
-    celltype_predictors: Sequence[PredictorWrapper],
-    counts: NumericArray,
-    train_indices: Union[Sequence[NDArray[intp]], NDArray[intp]],
-    test_indices: Union[Sequence[NDArray[intp]], NDArray[intp]],
-) -> list[Result]:
-    if len(global_predictors) != len(celltype_predictors):
-        raise ValueError(
-            "Global and celltype predictor lists must have the same length"
-        )
-
-    model_results: list[Result] = []
-    for global_model, celltype_model in zip(global_predictors, celltype_predictors):
-        model_results.append(
-            Result(
-                global_model=global_model,
-                celltype_model=celltype_model,
-                sample_results=get_sample_results(
-                    global_predictor=global_model.predictor,
-                    celltype_predictor=celltype_model.predictor,
-                    counts=counts,
-                    train_indices=train_indices,
-                    test_indices=test_indices,
-                ),
+    split_results: list[SplitResult] = []
+    for sample_idx, (train_idx, test_idx) in enumerate(zip(train_indices, test_indices)):
+        model_results: list[ModelSplitResult] = []
+        for model_name, global_model in global_models_by_name.items():
+            celltype_results: list[CelltypeSplitResult] = []
+            for prepared_celltype in prepared_celltypes:
+                observed_counts = np.asarray(prepared_celltype.metadata.observed_counts)
+                observed_train_counts = observed_counts[:, train_idx]
+                global_embedding, global_predicted_counts = global_model.predictor.predict(
+                    observed_train_counts,
+                    train_idx,
+                )
+                celltype_model = prepared_celltype.celltype_models_by_name[model_name]
+                celltype_embedding, celltype_predicted_counts = (
+                    celltype_model.predictor.predict(
+                        observed_train_counts,
+                        train_idx,
+                    )
+                )
+                observed_test_counts = observed_counts[:, test_idx]
+                celltype_results.append(
+                    CelltypeSplitResult(
+                        celltype=prepared_celltype.metadata.celltype,
+                        n_cells=int(observed_counts.shape[0]),
+                        observed_test_counts=observed_test_counts,
+                        global_model_embedding=global_embedding,
+                        global_model_predicted_test_counts=global_predicted_counts[
+                            :, test_idx
+                        ],
+                        celltype_model_embedding=celltype_embedding,
+                        celltype_model_predicted_test_counts=celltype_predicted_counts[
+                            :, test_idx
+                        ],
+                    )
+                )
+            model_results.append(
+                ModelSplitResult(
+                    model_name=model_name,
+                    celltype_results=celltype_results,
+                )
             )
-        )
-    return model_results
-
-
-def get_sample_results(
-    global_predictor: n2l.pd.PredictorProtocol,
-    celltype_predictor: n2l.pd.PredictorProtocol,
-    counts: NumericArray,
-    train_indices: Union[Sequence[NDArray[intp]], NDArray[intp]],
-    test_indices: Union[Sequence[NDArray[intp]], NDArray[intp]],
-) -> list[SampleResult]:
-    sample_results: list[SampleResult] = []
-    for idx, (train_idx, test_idx) in enumerate(zip(train_indices, test_indices)):
-        global_embedding, global_predicted_counts = global_predictor.predict(
-            counts[:, train_idx], train_idx
-        )
-        celltype_embedding, celltype_predicted_counts = celltype_predictor.predict(
-            counts[:, train_idx], train_idx
-        )
-        sample_results.append(
-            SampleResult(
-                sample_idx=idx,
+        split_results.append(
+            SplitResult(
+                sample_idx=sample_idx,
                 train_idx=train_idx,
                 test_idx=test_idx,
-                global_model_embedding=global_embedding,
-                global_model_predicted_counts=global_predicted_counts,
-                celltype_model_embedding=celltype_embedding,
-                celltype_model_predicted_counts=celltype_predicted_counts,
+                model_results=model_results,
             )
         )
-    return sample_results
+
+    return celltype_metadata, split_results
 
 
 def main() -> None:
