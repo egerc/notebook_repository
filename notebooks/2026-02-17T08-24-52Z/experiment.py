@@ -320,6 +320,7 @@ def run_experiment(config: Config) -> ExperimentResult:
         _adata_dense_mut(reference)
         celltypes, samples, models, results = get_relational_results(
             dataset_id=dataset_id,
+            celltype_id_offset=len(celltype_dimensions),
             query=query,
             reference=reference,
             query_ct_key=query_ct_key,
@@ -348,6 +349,7 @@ def run_experiment(config: Config) -> ExperimentResult:
 
 def get_relational_results(
     dataset_id: int,
+    celltype_id_offset: int,
     query: AnnData,
     reference: AnnData,
     query_ct_key: str,
@@ -399,7 +401,8 @@ def get_relational_results(
 
     prepared_celltypes: list[_PreparedCelltype] = []
     celltype_dimensions: list[CelltypeDimension] = []
-    for celltype_id, celltype in enumerate(shared_celltypes):
+    for local_celltype_id, celltype in enumerate(shared_celltypes):
+        celltype_id = celltype_id_offset + local_celltype_id
         query_celltype_mask = query_shared.obs[query_ct_key] == celltype
         reference_celltype_mask = reference_shared.obs[reference_ct_key] == celltype
         observed_counts = np.asarray(query_shared[query_celltype_mask].X)  # type: ignore[arg-type]
@@ -448,11 +451,15 @@ def get_relational_results(
         )
         for model_id, global_model in global_models_by_id.items():
             for prepared_celltype in prepared_celltypes:
-                observed_counts = np.asarray(prepared_celltype.dimension.observed_counts)
+                observed_counts = np.asarray(
+                    prepared_celltype.dimension.observed_counts
+                )
                 observed_train_counts = observed_counts[:, train_idx]
-                global_embedding, global_predicted_counts = global_model.predictor.predict(
-                    observed_train_counts,
-                    train_idx,
+                global_embedding, global_predicted_counts = (
+                    global_model.predictor.predict(
+                        observed_train_counts,
+                        train_idx,
+                    )
                 )
                 celltype_model = prepared_celltype.celltype_models_by_id[model_id]
                 celltype_embedding, celltype_predicted_counts = (
