@@ -392,7 +392,9 @@ def get_relational_results(
     global_models_by_id = {
         model_dimension.model_id: PredictorWrapper(
             name=model_dimension.model_name,
-            predictor=predictor_factory.create_predictor().fit(reference_shared.X),  # type: ignore[arg-type]
+            predictor=predictor_factory.create_predictor().fit(
+                reference_shared.X.astype(np.float64)
+            ),  # type: ignore[arg-type]
         )
         for model_dimension, predictor_factory in zip(
             model_dimensions, predictor_factories
@@ -424,7 +426,7 @@ def get_relational_results(
             model_dimension.model_id: PredictorWrapper(
                 name=model_dimension.model_name,
                 predictor=predictor_factory.create_predictor().fit(
-                    reference_shared[reference_celltype_mask].X  # type: ignore
+                    reference_shared[reference_celltype_mask].X.astype(np.float64)  # type: ignore
                 ),
             )
             for model_dimension, predictor_factory in zip(
@@ -457,14 +459,14 @@ def get_relational_results(
                 observed_train_counts = observed_counts[:, train_idx]
                 global_embedding, global_predicted_counts = (
                     global_model.predictor.predict(
-                        observed_train_counts,
+                        observed_train_counts.astype(np.float64),
                         train_idx,
                     )
                 )
                 celltype_model = prepared_celltype.celltype_models_by_id[model_id]
                 celltype_embedding, celltype_predicted_counts = (
                     celltype_model.predictor.predict(
-                        observed_train_counts,
+                        observed_train_counts.astype(np.float64),
                         train_idx,
                     )
                 )
