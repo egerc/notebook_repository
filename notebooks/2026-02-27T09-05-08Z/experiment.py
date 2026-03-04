@@ -12,6 +12,8 @@ import pandas as pd
 from anndata.typing import AnnData
 from numpy import intp, number
 from numpy.typing import NDArray
+from sklearn.decomposition import PCA
+from sklearn.neighbors import kneighbors_graph
 from sqlmodel import (
     Column,
     Field,
@@ -22,6 +24,7 @@ from sqlmodel import (
     TypeDecorator,
     create_engine,
 )
+from umap import UMAP
 
 NumericArray = NDArray[number]
 IndexArray = NDArray[intp]
@@ -75,6 +78,9 @@ class Celltype(SQLModel, table=True):
 
     name: str
     counts_matrix: NumericArray = Field(sa_column=Column(PklType))
+    pca_embedding: NumericArray = Field(sa_column=Column(PklType))
+    umap_embedding: NumericArray = Field(sa_column=Column(PklType))
+    adjacency_matrix: NumericArray = Field(sa_column=Column(PklType))
 
     dataset_id: int | None = Field(default=None, foreign_key="dataset.id")
     dataset: Dataset = Relationship(back_populates="celltypes")
@@ -258,10 +264,23 @@ def main():
                             )
                             for predictor in predictors
                         }
+                        counts_matrix = query[query_ct_mask, :].X
+                        pca_embedding = PCA(n_components=10).fit_transform(
+                            counts_matrix
+                        )
+                        umap_embedding = UMAP(n_components=2).fit_transform(
+                            counts_matrix
+                        )
+                        adjacency_matrix = kneighbors_graph(
+                            pca_embedding, n_neighbors=10
+                        )
 
                         celltype = Celltype(
                             name=celltype_name,
-                            counts_matrix=query[query_ct_mask, :].X,
+                            counts_matrix=counts_matrix,
+                            pca_embedding=pca_embedding,
+                            umap_embedding=umap_embedding,
+                            adjacency_matrix=adjacency_matrix,
                             dataset=dataset,
                         )
                         for model_name, model in model_objects.items():

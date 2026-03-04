@@ -8,4 +8,6 @@ dependencies = [
     "anndata>=0.12.10",
     "sqlmodel>=0.0.37",
     "mlflow>=3.10.0",
+    "scikit-learn>=1.8.0",
+    "polars>=1.38.1",
 ]
