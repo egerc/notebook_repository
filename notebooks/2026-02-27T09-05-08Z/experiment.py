@@ -1,9 +1,12 @@
+import os
 import pickle
+import tempfile
 from dataclasses import dataclass, replace
 from enum import Enum
 from typing import Callable
 
 import anndata as ad
+import mlflow
 import numpy as np
 import pandas as pd
 from anndata.typing import AnnData
@@ -35,9 +38,9 @@ class PklType(TypeDecorator):
         return None
 
     def process_result_value(self, value, dialect):
-        if value is not None:
-            return pickle.loads(value)
-        return None
+        # if value is not None:
+        #    return pickle.loads(value)
+        return pickle.loads(value)
 
 
 class ModalityEnum(str, Enum):
@@ -55,12 +58,6 @@ class PredictorWrapper:
 class LoaderFnWrapper:
     name: str
     loader: LoaderFn
-
-
-@dataclass(frozen=True)
-class ModelOutputs:
-    embedding: NumericArray
-    predicted_counts: NumericArray
 
 
 class Dataset(SQLModel, table=True):
@@ -113,8 +110,10 @@ class Result(SQLModel, table=True):
     model_config = {"arbitrary_types_allowed": True}
     id: int | None = Field(default=None, primary_key=True)
 
-    global_model_outputs: ModelOutputs = Field(sa_column=Column(PklType))
-    celltype_model_outputs: ModelOutputs = Field(sa_column=Column(PklType))
+    global_model_embedding: NumericArray = Field(sa_column=Column(PklType))
+    global_model_counts: NumericArray = Field(sa_column=Column(PklType))
+    celltype_model_embedding: NumericArray = Field(sa_column=Column(PklType))
+    celltype_model_counts: NumericArray = Field(sa_column=Column(PklType))
 
     celltype_id: int | None = Field(
         default=None, foreign_key="celltype.id", nullable=False
@@ -192,93 +191,112 @@ def main():
             name="mock_predictor_2", predictor=MockPredictor(n_components=5)
         ),
     ]
+    with mlflow.start_run():
+        with tempfile.TemporaryDirectory() as tmpdir:
+            sqlite_file_name = "database.db"
+            sqlite_folder_path = os.path.join(tmpdir, sqlite_file_name)
+            sqlite_url = f"sqlite:///{sqlite_folder_path}"
+            engine = create_engine(sqlite_url, echo=True)
+            SQLModel.metadata.create_all(engine)
 
-    sqlite_file_name = "database.db"
-    sqlite_url = f"sqlite:///{sqlite_file_name}"
-    engine = create_engine(sqlite_url, echo=True)
-    SQLModel.metadata.create_all(engine)
-
-    rng = np.random.default_rng(seed=0)
-    with Session(engine) as session:
-        model_objects = {
-            predictor.name: Model(name=predictor.name) for predictor in predictors
-        }
-        for loader_fn in loader_fns:
-            query, reference, query_ct_key, ref_ct_key = loader_fn.loader("./data")
-            dataset = Dataset(
-                name=loader_fn.name,
-            )
-            shared_celltypes = np.intersect1d(
-                ar1=np.array(query.obs[query_ct_key].unique()),
-                ar2=np.array(reference.obs[ref_ct_key].unique()),
-            )
-            shared_features = np.intersect1d(query.var_names, reference.var_names)
-            query = query[
-                query.obs[query_ct_key].isin(shared_celltypes.tolist()),
-                shared_features,
-            ]
-            reference = reference[
-                reference.obs[ref_ct_key].isin(shared_celltypes.tolist()),
-                shared_features,
-            ]
-            _adata_dense_mut(query)
-            _adata_dense_mut(reference)
-            train_idxs, test_idxs = _sample_indices(len(shared_features), 2, 10, rng)
-
-            sample_objects = [
-                Sample(
-                    id_of_sample=id_of_sample,
-                    train_idx=train_idx,
-                    test_idx=test_idx,
-                    dataset=dataset,
-                )
-                for id_of_sample, (train_idx, test_idx) in enumerate(
-                    zip(train_idxs, test_idxs)
-                )
-            ]
-            globally_fitted_models = {
-                predictor.name: predictor.predictor.fit(reference.X)
-                for predictor in predictors
-            }
-
-            for celltype_name in shared_celltypes:
-                query_ct_mask = query.obs[query_ct_key] == celltype_name
-                ref_ct_mask = reference.obs[ref_ct_key] == celltype_name
-                celltype_fitted_models = {
-                    predictor.name: predictor.predictor.fit(reference[ref_ct_mask, :].X)
+            rng = np.random.default_rng(seed=0)
+            with Session(engine) as session:
+                model_objects = {
+                    predictor.name: Model(name=predictor.name)
                     for predictor in predictors
                 }
+                for loader_fn in loader_fns:
+                    query, reference, query_ct_key, ref_ct_key = loader_fn.loader(
+                        "./data"
+                    )
+                    dataset = Dataset(
+                        name=loader_fn.name,
+                    )
+                    shared_celltypes = np.intersect1d(
+                        ar1=np.array(query.obs[query_ct_key].unique()),
+                        ar2=np.array(reference.obs[ref_ct_key].unique()),
+                    )
+                    shared_features = np.intersect1d(
+                        query.var_names, reference.var_names
+                    )
+                    query = query[
+                        query.obs[query_ct_key].isin(shared_celltypes.tolist()),
+                        shared_features,
+                    ]
+                    reference = reference[
+                        reference.obs[ref_ct_key].isin(shared_celltypes.tolist()),
+                        shared_features,
+                    ]
+                    _adata_dense_mut(query)
+                    _adata_dense_mut(reference)
+                    train_idxs, test_idxs = _sample_indices(
+                        len(shared_features), 2, 10, rng
+                    )
 
-                celltype = Celltype(
-                    name=celltype_name,
-                    counts_matrix=query[query_ct_mask, :].X,
-                    dataset=dataset,
-                )
-                for model_name, model in model_objects.items():
-                    globally_fitted_model = globally_fitted_models.get(model_name)
-                    celltype_fitted_model = celltype_fitted_models.get(model_name)
-                    for sample in sample_objects:
-                        global_model_outputs = ModelOutputs(
-                            *globally_fitted_model.predict(
-                                celltype.counts_matrix[:, sample.train_idx],
-                                sample.train_idx,
+                    sample_objects = [
+                        Sample(
+                            id_of_sample=id_of_sample,
+                            train_idx=train_idx,
+                            test_idx=test_idx,
+                            dataset=dataset,
+                        )
+                        for id_of_sample, (train_idx, test_idx) in enumerate(
+                            zip(train_idxs, test_idxs)
+                        )
+                    ]
+                    globally_fitted_models = {
+                        predictor.name: predictor.predictor.fit(reference.X)
+                        for predictor in predictors
+                    }
+
+                    for celltype_name in shared_celltypes:
+                        query_ct_mask = query.obs[query_ct_key] == celltype_name
+                        ref_ct_mask = reference.obs[ref_ct_key] == celltype_name
+                        celltype_fitted_models = {
+                            predictor.name: predictor.predictor.fit(
+                                reference[ref_ct_mask, :].X
                             )
+                            for predictor in predictors
+                        }
+
+                        celltype = Celltype(
+                            name=celltype_name,
+                            counts_matrix=query[query_ct_mask, :].X,
+                            dataset=dataset,
                         )
-                        celltype_model_outputs = ModelOutputs(
-                            *celltype_fitted_model.predict(
-                                celltype.counts_matrix[:, sample.train_idx],
-                                sample.train_idx,
+                        for model_name, model in model_objects.items():
+                            globally_fitted_model = globally_fitted_models.get(
+                                model_name
                             )
-                        )
-                        result = Result(
-                            global_model_outputs=global_model_outputs,
-                            celltype_model_outputs=celltype_model_outputs,
-                            sample=sample,
-                            model=model,
-                            celltype=celltype,
-                        )
-                        session.add(result)
-        session.commit()
+                            celltype_fitted_model = celltype_fitted_models.get(
+                                model_name
+                            )
+                            for sample in sample_objects:
+                                global_model_embedding, global_model_counts = (
+                                    globally_fitted_model.predict(
+                                        celltype.counts_matrix[:, sample.train_idx],
+                                        sample.train_idx,
+                                    )
+                                )
+                                celltype_model_embedding, celltype_model_counts = (
+                                    celltype_fitted_model.predict(
+                                        celltype.counts_matrix[:, sample.train_idx],
+                                        sample.train_idx,
+                                    )
+                                )
+
+                                result = Result(
+                                    global_model_embedding=global_model_embedding,
+                                    global_model_counts=global_model_counts,
+                                    celltype_model_embedding=celltype_model_embedding,
+                                    celltype_model_counts=celltype_model_counts,
+                                    sample=sample,
+                                    model=model,
+                                    celltype=celltype,
+                                )
+                                session.add(result)
+                session.commit()
+                mlflow.log_artifact(sqlite_folder_path)
 
 
 if __name__ == "__main__":
