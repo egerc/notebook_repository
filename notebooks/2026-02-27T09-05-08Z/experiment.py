@@ -273,10 +273,6 @@ def main():
     memory = Memory("cache")
     print(config)
 
-    # loader_fns = [
-    #    LoaderFnWrapper(name="mock_loader_1", loader=mock_loader),
-    #    LoaderFnWrapper(name="mock_loader_2", loader=mock_loader),
-    # ]
     loader_fns: list[LoaderFnWrapper] = [
         LoaderFnWrapper(
             name=loader_config.name,
@@ -303,6 +299,7 @@ def main():
     ]
 
     with mlflow.start_run():
+        mlflow.log_params(config.__dict__)
         with tempfile.TemporaryDirectory() as tmpdir:
             sqlite_file_name = "database.db"
             sqlite_folder_path = os.path.join(tmpdir, sqlite_file_name)
