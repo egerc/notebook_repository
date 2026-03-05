@@ -17,6 +17,7 @@ dependencies = [
     { name = "nico2-lib" },
     { name = "numpy" },
     { name = "polars" },
+    { name = "pydantic" },
     { name = "scikit-learn" },
     { name = "sqlmodel" },
 ]
@@ -28,6 +29,7 @@ requires-dist = [
     { name = "nico2-lib", git = "https://github.com/gruenlab/bioinfo-tools.git?subdirectory=applications%2Fnico2_lib&rev=e61ba36e4db5183ef3faad9e1ef11b228bc053f9" },
     { name = "numpy", specifier = ">=2.2.6" },
     { name = "polars", specifier = ">=1.38.1" },
+    { name = "pydantic", specifier = ">=2.12.5" },
     { name = "scikit-learn", specifier = ">=1.8.0" },
     { name = "sqlmodel", specifier = ">=0.0.37" },
 ]

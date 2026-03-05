@@ -1,15 +1,21 @@
+from functools import partial
 import os
 import pickle
 import tempfile
 from dataclasses import dataclass, replace
 from enum import Enum
-from typing import Callable
+from typing import Any, Callable, Literal
 
 import anndata as ad
+from joblib import Memory
 import mlflow
+import nico2_lib as n2l
 import numpy as np
 import pandas as pd
+from pydantic import BaseModel
+import yaml
 from anndata.typing import AnnData
+from nico2_lib.predictors._scvi._scvi_pred import ScviPredictor
 from numpy import intp, number
 from numpy.typing import NDArray
 from sklearn.decomposition import PCA
@@ -26,9 +32,34 @@ from sqlmodel import (
 )
 from umap import UMAP
 
+ModelArchitecture = Literal["mock", "nmf", "scvi"]
 NumericArray = NDArray[number]
 IndexArray = NDArray[intp]
-LoaderFn = Callable[[str], tuple[AnnData, AnnData, str, str]]
+LoaderFn = Callable[[], tuple[AnnData, AnnData, str, str]]
+
+
+class InputDataset(BaseModel):
+    name: str
+    query_path: str
+    query_ct_key: str
+    reference_path: str
+    reference_ct_key: str
+
+
+class Predictor(BaseModel):
+    name: str
+    log_transform: bool
+    model_architecture: str
+    kwargs: dict[str, Any]
+
+
+class Config(BaseModel):
+    n_samples: int = Field(ge=1)
+    sample_length: int = Field(ge=1)
+    n_pcs: int
+    n_neighbours: int
+    predictors: list[Predictor]
+    datasets: list[InputDataset]
 
 
 class PklType(TypeDecorator):
@@ -43,7 +74,7 @@ class PklType(TypeDecorator):
     def process_result_value(self, value, dialect):
         # if value is not None:
         #    return pickle.loads(value)
-        return pickle.loads(value)
+        return pickle.loads(value)  # type: ignore
 
 
 class ModalityEnum(str, Enum):
@@ -54,7 +85,16 @@ class ModalityEnum(str, Enum):
 @dataclass(frozen=True)
 class PredictorWrapper:
     name: str
+    log_transform: bool
     predictor: object
+
+    def fit(self, X: NumericArray) -> "PredictorWrapper":
+        data = np.log1p(X) if self.log_transform else X
+        return replace(self, predictor=self.predictor.fit(data))
+
+    def predict(self, X: NumericArray, idx: IndexArray) -> tuple[NumericArray, NumericArray]:
+        data = np.log1p(X) if self.log_transform else X
+        return self.predictor.predict(data, idx)
 
 
 @dataclass(frozen=True)
@@ -131,7 +171,7 @@ class Result(SQLModel, table=True):
     sample: Sample = Relationship(back_populates="results")
 
 
-def mock_loader(dir: str) -> tuple[AnnData, AnnData, str, str]:
+def mock_loader() -> tuple[AnnData, AnnData, str, str]:
     rng = np.random.default_rng(0)
     query_n_obs = 1000
     query_n_vars = 500
@@ -162,7 +202,7 @@ class MockPredictor:
         self, X: NumericArray, idx: IndexArray
     ) -> tuple[NumericArray, NumericArray]:
         rng = np.random.default_rng(0)
-        n_obs, n_vars = X.shape
+        n_obs, _ = X.shape
         embeddings = rng.normal(loc=0, scale=1, size=(n_obs, self.n_components))
         reconstructed_counts = rng.normal(loc=0, scale=1, size=X.shape)
         return embeddings, reconstructed_counts
@@ -184,19 +224,84 @@ def _sample_indices(
     return train_idx, test_idx
 
 
+PREDICTOR_REGISTRY: dict[ModelArchitecture, n2l.pd.PredictorProtocol] = {
+    "mock_predictor": MockPredictor,
+    "nmf": n2l.pd.NmfPredictor,
+    "scvi": ScviPredictor,
+}
+
+
+def _create_spatial_loader(
+    query_path: str,
+    query_ct_key: str,
+    reference_path: str,
+    reference_ct_key: str,
+    *,
+    memory: Memory,
+) -> Callable[[], tuple[AnnData, AnnData, str, str]]:
+    cached_transfer = memory.cache(n2l.lt.scvi_transfer)  # type: ignore
+    query_loader = partial(ad.read_h5ad, filename=query_path)
+    reference_loader = partial(ad.read_h5ad, filename=reference_path)
+
+    def loader() -> tuple[AnnData, AnnData, str, str]:
+        query = query_loader()
+        reference = reference_loader()
+
+        _adata_dense_mut(query)
+        _adata_dense_mut(reference)
+
+        query.obs[query_ct_key] = cached_transfer(  # type: ignore
+            query,
+            reference,
+            reference_ct_key,
+        )
+        shared_features = np.intersect1d(query.var_names, reference.var_names)
+        return (
+            query[:, shared_features],
+            reference[:, shared_features],
+            query_ct_key,
+            reference_ct_key,
+        )
+
+    return loader
+
+
 def main():
-    loader_fns = [
-        LoaderFnWrapper(name="mock_loader_1", loader=mock_loader),
-        LoaderFnWrapper(name="mock_loader_2", loader=mock_loader),
+    with open("config.yaml", "r") as f:
+        yaml_config = yaml.safe_load(f)
+    config = Config(**yaml_config)
+    memory = Memory("cache")
+    print(config)
+
+    # loader_fns = [
+    #    LoaderFnWrapper(name="mock_loader_1", loader=mock_loader),
+    #    LoaderFnWrapper(name="mock_loader_2", loader=mock_loader),
+    # ]
+    loader_fns: list[LoaderFnWrapper] = [
+        LoaderFnWrapper(
+            name=loader_config.name,
+            loader=_create_spatial_loader(
+                query_path=loader_config.query_path,
+                query_ct_key=loader_config.query_ct_key,
+                reference_path=loader_config.reference_path,
+                reference_ct_key=loader_config.reference_ct_key,
+                memory=memory,
+            ),
+        )
+        for loader_config in config.datasets
     ]
-    predictors = [
+
+    predictors: list[PredictorWrapper] = [
         PredictorWrapper(
-            name="mock_predictor_1", predictor=MockPredictor(n_components=5)
-        ),
-        PredictorWrapper(
-            name="mock_predictor_2", predictor=MockPredictor(n_components=5)
-        ),
+            name=predictor_config.name,
+            log_transform=predictor_config.log_transform,
+            predictor=PREDICTOR_REGISTRY[predictor_config.model_architecture](  # type: ignore
+                **predictor_config.kwargs  # type: ignore
+            ),
+        )
+        for predictor_config in config.predictors
     ]
+
     with mlflow.start_run():
         with tempfile.TemporaryDirectory() as tmpdir:
             sqlite_file_name = "database.db"
@@ -212,9 +317,7 @@ def main():
                     for predictor in predictors
                 }
                 for loader_fn in loader_fns:
-                    query, reference, query_ct_key, ref_ct_key = loader_fn.loader(
-                        "./data"
-                    )
+                    query, reference, query_ct_key, ref_ct_key = loader_fn.loader()
                     dataset = Dataset(
                         name=loader_fn.name,
                     )
@@ -236,7 +339,10 @@ def main():
                     _adata_dense_mut(query)
                     _adata_dense_mut(reference)
                     train_idxs, test_idxs = _sample_indices(
-                        len(shared_features), 2, 10, rng
+                        len(shared_features),
+                        config.n_samples,
+                        config.sample_length,
+                        rng,
                     )
 
                     sample_objects = [
@@ -251,7 +357,7 @@ def main():
                         )
                     ]
                     globally_fitted_models = {
-                        predictor.name: predictor.predictor.fit(reference.X)
+                        predictor.name: predictor.fit(reference.X)
                         for predictor in predictors
                     }
 
@@ -259,20 +365,18 @@ def main():
                         query_ct_mask = query.obs[query_ct_key] == celltype_name
                         ref_ct_mask = reference.obs[ref_ct_key] == celltype_name
                         celltype_fitted_models = {
-                            predictor.name: predictor.predictor.fit(
-                                reference[ref_ct_mask, :].X
-                            )
+                            predictor.name: predictor.fit(reference[ref_ct_mask, :].X)
                             for predictor in predictors
                         }
                         counts_matrix = query[query_ct_mask, :].X
-                        pca_embedding = PCA(n_components=10).fit_transform(
+                        pca_embedding = PCA(n_components=config.n_pcs).fit_transform(
                             counts_matrix
                         )
                         umap_embedding = UMAP(n_components=2).fit_transform(
                             counts_matrix
                         )
                         adjacency_matrix = kneighbors_graph(
-                            pca_embedding, n_neighbors=10
+                            pca_embedding, n_neighbors=config.n_neighbours
                         )
 
                         celltype = Celltype(
@@ -284,12 +388,8 @@ def main():
                             dataset=dataset,
                         )
                         for model_name, model in model_objects.items():
-                            globally_fitted_model = globally_fitted_models.get(
-                                model_name
-                            )
-                            celltype_fitted_model = celltype_fitted_models.get(
-                                model_name
-                            )
+                            globally_fitted_model = globally_fitted_models[model_name]
+                            celltype_fitted_model = celltype_fitted_models[model_name]
                             for sample in sample_objects:
                                 global_model_embedding, global_model_counts = (
                                     globally_fitted_model.predict(
