@@ -1,7 +1,7 @@
 n_samples: 5
 sample_length: 20
-n_pcs: 8
-n_neighbours: 6
+max_n_pcs: 25
+max_n_neighbours: 15
 predictors:
   - name: nmf_3_raw
     model_architecture: nmf
@@ -19,12 +19,6 @@ predictors:
     kwargs:
       n_factors: 3
 datasets:
-  - type: spatial
-    name: mouse_intestine_spatial
-    query_path: ../data/mouse_small_intestine_merfish/mouse_small_intestine_merfish.h5ad
-    query_ct_key: "cluster"
-    reference_path: ../data/mouse_small_intestine_sc/mouse_small_intestine_sc.h5ad
-    reference_ct_key: "cluster"
   - type: pseudospatial
     name: mouse_intestine_pseudospatial
     data_path: ../data/mouse_small_intestine_sc/mouse_small_intestine_sc.h5ad

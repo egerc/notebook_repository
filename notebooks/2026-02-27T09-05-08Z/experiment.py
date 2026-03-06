@@ -3,7 +3,7 @@ import pickle
 import tempfile
 from dataclasses import dataclass, replace
 from enum import Enum
-from functools import partial
+from functools import partial, reduce
 from typing import Annotated, Any, Callable, Literal
 
 import anndata as ad
@@ -66,8 +66,8 @@ class Predictor(BaseModel):
 class Config(BaseModel):
     n_samples: int = Field(ge=1)
     sample_length: int = Field(ge=1)
-    n_pcs: int
-    n_neighbours: int
+    max_n_pcs: int
+    max_n_neighbours: int
     predictors: list[Predictor]
     datasets: list[
         Annotated[
@@ -137,6 +137,8 @@ class Celltype(SQLModel, table=True):
     pca_embedding: NumericArray = Field(sa_column=Column(PklType))
     umap_embedding: NumericArray = Field(sa_column=Column(PklType))
     adjacency_matrix: NumericArray = Field(sa_column=Column(PklType))
+    n_pcs = int
+    n_neighbours: int
 
     dataset_id: int | None = Field(default=None, foreign_key="dataset.id")
     dataset: Dataset = Relationship(back_populates="celltypes")
@@ -419,14 +421,20 @@ def main():
                         counts_matrix: NumericArray = np.array(
                             query[query_ct_mask, :].X
                         )
+                        n_obs, n_vars = counts_matrix.shape
+
+                        n_pcs: int = reduce(min, [config.max_n_pcs, n_obs, n_vars])
                         pca_embedding: NumericArray = np.array(
-                            PCA(n_components=config.n_pcs).fit_transform(counts_matrix)
+                            PCA(n_components=n_pcs).fit_transform(counts_matrix)
                         )
                         umap_embedding: NumericArray = UMAP(
                             n_components=2
                         ).fit_transform(counts_matrix)
+                        n_neighbours = reduce(min, [config.max_n_neighbours, n_pcs])
+                        if n_pcs == n_neighbours:
+                            n_neighbours -= 1
                         adjacency_matrix: NumericArray = kneighbors_graph(
-                            pca_embedding, n_neighbors=config.n_neighbours
+                            pca_embedding, n_neighbors=n_neighbours
                         )
 
                         celltype = Celltype(
@@ -436,6 +444,8 @@ def main():
                             umap_embedding=umap_embedding,
                             adjacency_matrix=adjacency_matrix,
                             dataset=dataset,
+                            n_pcs=n_pcs,
+                            n_neighbours=n_neighbours,
                         )
                         for model_name, model in model_objects.items():
                             globally_fitted_model = globally_fitted_models[model_name]
