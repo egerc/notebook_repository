@@ -137,7 +137,7 @@ class Celltype(SQLModel, table=True):
     pca_embedding: NumericArray = Field(sa_column=Column(PklType))
     umap_embedding: NumericArray = Field(sa_column=Column(PklType))
     adjacency_matrix: NumericArray = Field(sa_column=Column(PklType))
-    n_pcs = int
+    n_pcs: int
     n_neighbours: int
 
     dataset_id: int | None = Field(default=None, foreign_key="dataset.id")
