@@ -374,7 +374,7 @@ def main():
                     shared_celltypes: list[str] = np.intersect1d(
                         ar1=np.array(query.obs[query_ct_key].unique()),
                         ar2=np.array(reference.obs[ref_ct_key].unique()),
-                    ).tolist
+                    ).tolist()
                     shared_features = np.intersect1d(
                         query.var_names, reference.var_names
                     )
