@@ -12,3 +12,6 @@ dependencies = [
     "polars>=1.38.1",
     "pydantic>=2.12.5",
 ]
+
+[tool.basedpyright]
+exclude = ["**/*.ipynb"]

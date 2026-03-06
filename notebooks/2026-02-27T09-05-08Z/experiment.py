@@ -1,23 +1,25 @@
-from functools import partial
 import os
 import pickle
 import tempfile
 from dataclasses import dataclass, replace
 from enum import Enum
-from typing import Any, Callable, Literal
+from functools import partial
+from typing import Annotated, Any, Callable, Literal
 
 import anndata as ad
-from joblib import Memory
 import mlflow
 import nico2_lib as n2l
 import numpy as np
 import pandas as pd
-from pydantic import BaseModel
+import scanpy as sc
 import yaml
+from anndata.io import read_h5ad
 from anndata.typing import AnnData
+from joblib import Memory
 from nico2_lib.predictors._scvi._scvi_pred import ScviPredictor
 from numpy import intp, number
 from numpy.typing import NDArray
+from pydantic import BaseModel
 from sklearn.decomposition import PCA
 from sklearn.neighbors import kneighbors_graph
 from sqlmodel import (
@@ -38,12 +40,20 @@ IndexArray = NDArray[intp]
 LoaderFn = Callable[[], tuple[AnnData, AnnData, str, str]]
 
 
-class InputDataset(BaseModel):
+class SpatialInputDataset(BaseModel):
+    type: Literal["spatial"]
     name: str
     query_path: str
     query_ct_key: str
     reference_path: str
     reference_ct_key: str
+
+
+class PseudospatialInputDataset(BaseModel):
+    type: Literal["pseudospatial"]
+    name: str
+    data_path: str
+    data_ct_key: str
 
 
 class Predictor(BaseModel):
@@ -59,7 +69,11 @@ class Config(BaseModel):
     n_pcs: int
     n_neighbours: int
     predictors: list[Predictor]
-    datasets: list[InputDataset]
+    datasets: list[
+        Annotated[
+            SpatialInputDataset | PseudospatialInputDataset, Field(discriminator="type")
+        ]
+    ]
 
 
 class PklType(TypeDecorator):
@@ -92,7 +106,9 @@ class PredictorWrapper:
         data = np.log1p(X) if self.log_transform else X
         return replace(self, predictor=self.predictor.fit(data))
 
-    def predict(self, X: NumericArray, idx: IndexArray) -> tuple[NumericArray, NumericArray]:
+    def predict(
+        self, X: NumericArray, idx: IndexArray
+    ) -> tuple[NumericArray, NumericArray]:
         data = np.log1p(X) if self.log_transform else X
         return self.predictor.predict(data, idx)
 
@@ -266,6 +282,50 @@ def _create_spatial_loader(
     return loader
 
 
+def _create_pseudospatial_loader(data_path: str, data_ct_key: str) -> LoaderFn:
+    def split_loader() -> tuple[AnnData, AnnData, str, str]:
+        loader_func: Callable[[], AnnData] = partial(read_h5ad, data_path)
+        adata = loader_func(dir)
+        n_cells = adata.n_obs
+        shuffled_idx = np.random.permutation(n_cells)
+        split_idx = n_cells // 2
+        idx1, idx2 = shuffled_idx[:split_idx], shuffled_idx[split_idx:]
+        query = adata[idx1].copy()
+        reference = adata[idx2].copy()
+        sc.pp.highly_variable_genes(
+            query, n_top_genes=500, flavor="seurat_v3", inplace=True
+        )
+        query = query[:, query.var["highly_variable"]].copy()
+        return query, reference, data_ct_key, data_ct_key
+
+    return split_loader
+
+
+def loader_config_to_loader(
+    loader_config: SpatialInputDataset | PseudospatialInputDataset, memory: Memory
+) -> LoaderFnWrapper:
+    match loader_config:
+        case SpatialInputDataset():
+            return LoaderFnWrapper(
+                name=loader_config.name,
+                loader=_create_spatial_loader(
+                    query_path=loader_config.query_path,
+                    query_ct_key=loader_config.query_ct_key,
+                    reference_path=loader_config.reference_path,
+                    reference_ct_key=loader_config.reference_ct_key,
+                    memory=memory,
+                ),
+            )
+        case PseudospatialInputDataset():
+            return LoaderFnWrapper(
+                name=loader_config.name,
+                loader=_create_pseudospatial_loader(
+                    data_path=loader_config.data_path,
+                    data_ct_key=loader_config.data_ct_key,
+                ),
+            )
+
+
 def main():
     with open("config.yaml", "r") as f:
         yaml_config = yaml.safe_load(f)
@@ -274,16 +334,7 @@ def main():
     print(config)
 
     loader_fns: list[LoaderFnWrapper] = [
-        LoaderFnWrapper(
-            name=loader_config.name,
-            loader=_create_spatial_loader(
-                query_path=loader_config.query_path,
-                query_ct_key=loader_config.query_ct_key,
-                reference_path=loader_config.reference_path,
-                reference_ct_key=loader_config.reference_ct_key,
-                memory=memory,
-            ),
-        )
+        loader_config_to_loader(loader_config, memory=memory)
         for loader_config in config.datasets
     ]
 
@@ -299,7 +350,7 @@ def main():
     ]
 
     with mlflow.start_run():
-        mlflow.log_params(config.__dict__)
+        mlflow.log_params(config.__dict__)  # type: ignore
         with tempfile.TemporaryDirectory() as tmpdir:
             sqlite_file_name = "database.db"
             sqlite_folder_path = os.path.join(tmpdir, sqlite_file_name)
@@ -318,19 +369,19 @@ def main():
                     dataset = Dataset(
                         name=loader_fn.name,
                     )
-                    shared_celltypes = np.intersect1d(
+                    shared_celltypes: list[str] = np.intersect1d(
                         ar1=np.array(query.obs[query_ct_key].unique()),
                         ar2=np.array(reference.obs[ref_ct_key].unique()),
-                    )
+                    ).tolist
                     shared_features = np.intersect1d(
                         query.var_names, reference.var_names
                     )
                     query = query[
-                        query.obs[query_ct_key].isin(shared_celltypes.tolist()),
+                        query.obs[query_ct_key].isin(shared_celltypes),
                         shared_features,
                     ]
                     reference = reference[
-                        reference.obs[ref_ct_key].isin(shared_celltypes.tolist()),
+                        reference.obs[ref_ct_key].isin(shared_celltypes),
                         shared_features,
                     ]
                     _adata_dense_mut(query)
@@ -365,14 +416,16 @@ def main():
                             predictor.name: predictor.fit(reference[ref_ct_mask, :].X)
                             for predictor in predictors
                         }
-                        counts_matrix = query[query_ct_mask, :].X
-                        pca_embedding = PCA(n_components=config.n_pcs).fit_transform(
-                            counts_matrix
+                        counts_matrix: NumericArray = np.array(
+                            query[query_ct_mask, :].X
                         )
-                        umap_embedding = UMAP(n_components=2).fit_transform(
-                            counts_matrix
+                        pca_embedding: NumericArray = np.array(
+                            PCA(n_components=config.n_pcs).fit_transform(counts_matrix)
                         )
-                        adjacency_matrix = kneighbors_graph(
+                        umap_embedding: NumericArray = UMAP(
+                            n_components=2
+                        ).fit_transform(counts_matrix)
+                        adjacency_matrix: NumericArray = kneighbors_graph(
                             pca_embedding, n_neighbors=config.n_neighbours
                         )
 
