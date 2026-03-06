@@ -287,7 +287,7 @@ def _create_spatial_loader(
 def _create_pseudospatial_loader(data_path: str, data_ct_key: str) -> LoaderFn:
     def split_loader() -> tuple[AnnData, AnnData, str, str]:
         loader_func: Callable[[], AnnData] = partial(read_h5ad, data_path)
-        adata = loader_func(dir)
+        adata = loader_func()
         n_cells = adata.n_obs
         shuffled_idx = np.random.permutation(n_cells)
         split_idx = n_cells // 2
