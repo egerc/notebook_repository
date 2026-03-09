@@ -178,10 +178,14 @@ class Result(SQLModel, table=True):
     model_config = {"arbitrary_types_allowed": True}
     id: int | None = Field(default=None, primary_key=True)
 
-    global_model_embedding: NumericArray = Field(sa_column=Column(PklType))
-    global_model_counts: NumericArray = Field(sa_column=Column(PklType))
-    celltype_model_embedding: NumericArray = Field(sa_column=Column(PklType))
-    celltype_model_counts: NumericArray = Field(sa_column=Column(PklType))
+    global_model_embedding_reference: NumericArray = Field(sa_column=Column(PklType))
+    global_model_counts_reference: NumericArray = Field(sa_column=Column(PklType))
+    celltype_model_embedding_reference: NumericArray = Field(sa_column=Column(PklType))
+    celltype_model_counts_reference: NumericArray = Field(sa_column=Column(PklType))
+    global_model_embedding_query: NumericArray = Field(sa_column=Column(PklType))
+    global_model_counts_query: NumericArray = Field(sa_column=Column(PklType))
+    celltype_model_embedding_query: NumericArray = Field(sa_column=Column(PklType))
+    celltype_model_counts_query: NumericArray = Field(sa_column=Column(PklType))
 
     celltype_id: int | None = Field(
         default=None, foreign_key="celltype.id", nullable=False
@@ -478,24 +482,44 @@ def main():
                             globally_fitted_model = globally_fitted_models[model_name]
                             celltype_fitted_model = celltype_fitted_models[model_name]
                             for sample in sample_objects:
-                                global_model_embedding, global_model_counts = (
-                                    globally_fitted_model.predict(
-                                        query_counts_matrix[:, sample.train_idx],
-                                        sample.train_idx,
-                                    )
+                                (
+                                    global_model_embedding_reference,
+                                    global_model_counts_reference,
+                                ) = globally_fitted_model.predict(
+                                    reference_counts_matrix[:, sample.train_idx],
+                                    sample.train_idx,
                                 )
-                                celltype_model_embedding, celltype_model_counts = (
-                                    celltype_fitted_model.predict(
-                                        query_counts_matrix[:, sample.train_idx],
-                                        sample.train_idx,
-                                    )
+                                (
+                                    global_model_embedding_query,
+                                    global_model_counts_query,
+                                ) = globally_fitted_model.predict(
+                                    query_counts_matrix[:, sample.train_idx],
+                                    sample.train_idx,
+                                )
+                                (
+                                    celltype_model_embedding_reference,
+                                    celltype_model_counts_reference,
+                                ) = celltype_fitted_model.predict(
+                                    reference_counts_matrix[:, sample.train_idx],
+                                    sample.train_idx,
+                                )
+                                (
+                                    celltype_model_embedding_query,
+                                    celltype_model_counts_query,
+                                ) = celltype_fitted_model.predict(
+                                    query_counts_matrix[:, sample.train_idx],
+                                    sample.train_idx,
                                 )
 
                                 result = Result(
-                                    global_model_embedding=global_model_embedding,
-                                    global_model_counts=global_model_counts,
-                                    celltype_model_embedding=celltype_model_embedding,
-                                    celltype_model_counts=celltype_model_counts,
+                                    global_model_embedding_reference=global_model_embedding_reference,
+                                    global_model_counts_reference=global_model_counts_reference,
+                                    celltype_model_embedding_reference=celltype_model_embedding_reference,
+                                    celltype_model_counts_reference=celltype_model_counts_reference,
+                                    global_model_embedding_query=global_model_embedding_query,
+                                    global_model_counts_query=global_model_counts_query,
+                                    celltype_model_embedding_query=celltype_model_embedding_query,
+                                    celltype_model_counts_query=celltype_model_counts_query,
                                     sample=sample,
                                     model=model,
                                     celltype=celltype,
