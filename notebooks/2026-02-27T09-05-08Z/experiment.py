@@ -88,7 +88,7 @@ class PklType(TypeDecorator):
     def process_result_value(self, value, dialect):
         # if value is not None:
         #    return pickle.loads(value)
-        return pickle.loads(value)  # type: ignore
+        return pickle.loads(value)
 
 
 class ModalityEnum(str, Enum):
@@ -104,13 +104,13 @@ class PredictorWrapper:
 
     def fit(self, X: NumericArray) -> "PredictorWrapper":
         data = np.log1p(X) if self.log_transform else X
-        return replace(self, predictor=self.predictor.fit(data))
+        return replace(self, predictor=self.predictor.fit(data))  # type: ignore
 
     def predict(
         self, X: NumericArray, idx: IndexArray
     ) -> tuple[NumericArray, NumericArray]:
         data = np.log1p(X) if self.log_transform else X
-        return self.predictor.predict(data, idx)
+        return self.predictor.predict(data, idx)  # type: ignore
 
 
 @dataclass(frozen=True)
@@ -133,10 +133,14 @@ class Celltype(SQLModel, table=True):
     id: int | None = Field(default=None, primary_key=True)
 
     name: str
-    counts_matrix: NumericArray = Field(sa_column=Column(PklType))
-    pca_embedding: NumericArray = Field(sa_column=Column(PklType))
-    umap_embedding: NumericArray = Field(sa_column=Column(PklType))
-    adjacency_matrix: NumericArray = Field(sa_column=Column(PklType))
+    reference_counts_matrix: NumericArray = Field(sa_column=Column(PklType))
+    reference_pca_embedding: NumericArray = Field(sa_column=Column(PklType))
+    reference_umap_embedding: NumericArray = Field(sa_column=Column(PklType))
+    reference_adjacency_matrix: NumericArray = Field(sa_column=Column(PklType))
+    query_counts_matrix: NumericArray = Field(sa_column=Column(PklType))
+    query_pca_embedding: NumericArray = Field(sa_column=Column(PklType))
+    query_umap_embedding: NumericArray = Field(sa_column=Column(PklType))
+    query_adjacency_matrix: NumericArray = Field(sa_column=Column(PklType))
     n_pcs: int
     n_neighbours: int
 
@@ -242,7 +246,7 @@ def _sample_indices(
     return train_idx, test_idx
 
 
-PREDICTOR_REGISTRY: dict[ModelArchitecture, n2l.pd.PredictorProtocol] = {
+PREDICTOR_REGISTRY: dict[ModelArchitecture, n2l.pd.PredictorProtocol] = {  # type: ignore
     "mock_predictor": MockPredictor,
     "nmf": n2l.pd.NmfPredictor,
     "scvi": ScviPredictor,
@@ -257,7 +261,7 @@ def _create_spatial_loader(
     *,
     memory: Memory,
 ) -> Callable[[], tuple[AnnData, AnnData, str, str]]:
-    cached_transfer = memory.cache(n2l.lt.scvi_transfer)  # type: ignore
+    cached_transfer = memory.cache(n2l.lt.scvi_transfer)
     query_loader = partial(ad.read_h5ad, filename=query_path)
     reference_loader = partial(ad.read_h5ad, filename=reference_path)
 
@@ -268,7 +272,7 @@ def _create_spatial_loader(
         _adata_dense_mut(query)
         _adata_dense_mut(reference)
 
-        query.obs[query_ct_key] = cached_transfer(  # type: ignore
+        query.obs[query_ct_key] = cached_transfer(
             query,
             reference,
             reference_ct_key,
@@ -345,13 +349,13 @@ def main():
             name=predictor_config.name,
             log_transform=predictor_config.log_transform,
             predictor=PREDICTOR_REGISTRY[predictor_config.model_architecture](  # type: ignore
-                **predictor_config.kwargs  # type: ignore
+                **predictor_config.kwargs
             ),
         )
         for predictor_config in config.predictors
     ]
 
-    with mlflow.start_run():
+    with mlflow.start_run():  # type: ignore
         mlflow.log_params(config.__dict__)  # type: ignore
         with tempfile.TemporaryDirectory() as tmpdir:
             sqlite_file_name = "database.db"
@@ -372,18 +376,18 @@ def main():
                         name=loader_fn.name,
                     )
                     shared_celltypes: list[str] = np.intersect1d(
-                        ar1=np.array(query.obs[query_ct_key].unique()),
-                        ar2=np.array(reference.obs[ref_ct_key].unique()),
+                        ar1=np.array(query.obs[query_ct_key].unique()),  # type: ignore
+                        ar2=np.array(reference.obs[ref_ct_key].unique()),  # type: ignore
                     ).tolist()
                     shared_features = np.intersect1d(
                         query.var_names, reference.var_names
                     )
                     query = query[
-                        query.obs[query_ct_key].isin(shared_celltypes),
+                        query.obs[query_ct_key].isin(shared_celltypes),  # type: ignore
                         shared_features,
                     ]
                     reference = reference[
-                        reference.obs[ref_ct_key].isin(shared_celltypes),
+                        reference.obs[ref_ct_key].isin(shared_celltypes),  # type: ignore
                         shared_features,
                     ]
                     _adata_dense_mut(query)
@@ -407,42 +411,65 @@ def main():
                         )
                     ]
                     globally_fitted_models = {
-                        predictor.name: predictor.fit(reference.X)
+                        predictor.name: predictor.fit(reference.X)  # type: ignore
                         for predictor in predictors
                     }
 
                     for celltype_name in shared_celltypes:
                         query_ct_mask = query.obs[query_ct_key] == celltype_name
                         ref_ct_mask = reference.obs[ref_ct_key] == celltype_name
+                        n_obs_query = np.sum(query_ct_mask)
+                        n_vars = len(shared_features)
+                        n_obs_ref = np.sum(ref_ct_mask)
+                        reference_ct = reference[ref_ct_mask].copy()
+                        _adata_dense_mut(reference_ct)
+                        reference_counts_matrix: NumericArray = reference_ct.X.copy()  # type: ignore
+
                         celltype_fitted_models = {
-                            predictor.name: predictor.fit(reference[ref_ct_mask, :].X)
+                            predictor.name: predictor.fit(reference_counts_matrix)
                             for predictor in predictors
                         }
-                        counts_matrix: NumericArray = np.array(
-                            query[query_ct_mask, :].X
-                        )
-                        n_obs, n_vars = counts_matrix.shape
+                        query_ct = query[query_ct_mask].copy()
+                        _adata_dense_mut(query_ct)
+                        query_counts_matrix: NumericArray = query_ct.X.copy()  # type: ignore
 
-                        n_pcs: int = reduce(min, [config.max_n_pcs, n_obs, n_vars])
-                        pca_embedding: NumericArray = np.array(
-                            PCA(n_components=n_pcs).fit_transform(counts_matrix)
+                        n_pcs: int = reduce(
+                            min, [config.max_n_pcs, n_obs_query, n_obs_ref, n_vars]
                         )
-                        umap_embedding: NumericArray = UMAP(
+                        query_pca_embedding: NumericArray = np.array(
+                            PCA(n_components=n_pcs).fit_transform(query_counts_matrix)
+                        )
+                        reference_pca_embedding = np.array(
+                            PCA(n_components=n_pcs).fit_transform(
+                                reference_counts_matrix
+                            )
+                        )
+                        query_umap_embedding: NumericArray = UMAP(
                             n_components=2
-                        ).fit_transform(counts_matrix)
+                        ).fit_transform(query_counts_matrix)
+                        reference_umap_embedding = UMAP(n_components=2).fit_transform(
+                            reference_counts_matrix
+                        )
                         n_neighbours = reduce(min, [config.max_n_neighbours, n_pcs])
                         if n_pcs == n_neighbours:
                             n_neighbours -= 1
-                        adjacency_matrix: NumericArray = kneighbors_graph(
-                            pca_embedding, n_neighbors=n_neighbours
+                        query_adjacency_matrix: NumericArray = kneighbors_graph(
+                            query_pca_embedding, n_neighbors=n_neighbours
+                        )
+                        reference_adjacency_matrix = kneighbors_graph(
+                            reference_pca_embedding, n_neighbors=n_neighbours
                         )
 
                         celltype = Celltype(
                             name=celltype_name,
-                            counts_matrix=counts_matrix,
-                            pca_embedding=pca_embedding,
-                            umap_embedding=umap_embedding,
-                            adjacency_matrix=adjacency_matrix,
+                            reference_counts_matrix=reference_counts_matrix,
+                            reference_pca_embedding=reference_pca_embedding,
+                            reference_umap_embedding=reference_umap_embedding,
+                            reference_adjacency_matrix=reference_adjacency_matrix,
+                            query_counts_matrix=query_counts_matrix,
+                            query_pca_embedding=query_pca_embedding,
+                            query_umap_embedding=query_umap_embedding,
+                            query_adjacency_matrix=query_adjacency_matrix,
                             dataset=dataset,
                             n_pcs=n_pcs,
                             n_neighbours=n_neighbours,
@@ -453,13 +480,13 @@ def main():
                             for sample in sample_objects:
                                 global_model_embedding, global_model_counts = (
                                     globally_fitted_model.predict(
-                                        celltype.counts_matrix[:, sample.train_idx],
+                                        query_counts_matrix[:, sample.train_idx],
                                         sample.train_idx,
                                     )
                                 )
                                 celltype_model_embedding, celltype_model_counts = (
                                     celltype_fitted_model.predict(
-                                        celltype.counts_matrix[:, sample.train_idx],
+                                        query_counts_matrix[:, sample.train_idx],
                                         sample.train_idx,
                                     )
                                 )
@@ -475,7 +502,7 @@ def main():
                                 )
                                 session.add(result)
                 session.commit()
-                mlflow.log_artifact(sqlite_folder_path)
+                mlflow.log_artifact(sqlite_folder_path)  # type: ignore
 
 
 if __name__ == "__main__":

@@ -19,6 +19,12 @@ predictors:
     kwargs:
       n_factors: 3
 datasets:
+  - type: spatial
+    name: mouse_intestine_spatial
+    query_path: ../data/mouse_small_intestine_merfish/mouse_small_intestine_merfish.h5ad
+    query_ct_key: "cluster"
+    reference_path: ../data/mouse_small_intestine_sc/mouse_small_intestine_sc.h5ad
+    reference_ct_key: "cluster"
   - type: pseudospatial
     name: mouse_intestine_pseudospatial
     data_path: ../data/mouse_small_intestine_sc/mouse_small_intestine_sc.h5ad
