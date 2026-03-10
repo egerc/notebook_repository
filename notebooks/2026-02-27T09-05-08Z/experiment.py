@@ -450,9 +450,9 @@ def main():
                         )
                         query_umap_embedding: NumericArray = UMAP(
                             n_components=2
-                        ).fit_transform(query_counts_matrix)
+                        ).fit_transform(query_pca_embedding)
                         reference_umap_embedding = UMAP(n_components=2).fit_transform(
-                            reference_counts_matrix
+                            reference_pca_embedding
                         )
                         n_neighbours = reduce(min, [config.max_n_neighbours, n_pcs])
                         if n_pcs == n_neighbours:
