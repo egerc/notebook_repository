@@ -6,6 +6,8 @@ sample_length: 20
 n_pca_components: 10
 dataloader_keys: # possible dataloaders: small_mouse_intestine_spatial, small_mouse_intestinal_pseudospatial, human_liver_spatial, human_liver_pseudospatial
   - small_mouse_intestine_spatial
+  - small_mouse_intestine_pseudospatial
 predictor_keys: # possible predictors: NMF_3, NMF_8
   - NMF_3
   - NMF_8
+  - SCVI_3

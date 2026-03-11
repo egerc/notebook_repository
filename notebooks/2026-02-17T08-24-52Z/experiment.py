@@ -204,7 +204,7 @@ def _sample_indices(
 
 
 def _filter_celltypes(adata: AnnData, ct_key: str, min_count: int) -> list[str]:
-    celltypes = adata.obs[ct_key].value_counts()
+    celltypes = adata.obs[ct_key].value_counts() # type: ignore
     return celltypes[celltypes >= min_count].index.tolist()  # type: ignore
 
 
