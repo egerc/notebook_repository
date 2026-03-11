@@ -29,7 +29,7 @@ fi
 # Timestamp command as defined in README.md:
 #   date -u +%Y-%m-%dT%H-%M-%SZ
 ts="$(date -u +%Y-%m-%dT%H-%M-%SZ)"
-dir="$ts"
+dir="notebooks/$ts"
 
 if [[ -e "$dir" ]]; then
   echo "Error: path already exists: $dir" >&2
