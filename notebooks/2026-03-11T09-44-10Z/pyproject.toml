@@ -1,0 +1,14 @@
+[project]
+name = "2026-03-11t09-44-10z"
+version = "0.1.0"
+requires-python = ">=3.11"
+dependencies = [
+    "nico2-lib @ git+https://github.com/gruenlab/bioinfo-tools.git@e61ba36e4db5183ef3faad9e1ef11b228bc053f9#subdirectory=applications/nico2_lib",
+    "anndata>=0.12.10",
+    "mlflow>=3.10.1",
+    "numpy>=2.4.3",
+    "polars>=1.38.1",
+    "pydantic>=2.12.5",
+    "scikit-learn>=1.8.0",
+    "sqlmodel>=0.0.37",
+]
