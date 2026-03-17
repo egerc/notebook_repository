@@ -66,6 +66,7 @@ class Predictor(BaseModel):
 class Config(BaseModel):
     n_samples: int = Field(ge=1)
     sample_length: int = Field(ge=1)
+    min_n_cells_celltype: int
     max_n_pcs: int
     max_n_neighbours: int
     predictors: list[Predictor]
@@ -379,9 +380,16 @@ def main():
                     dataset = Dataset(
                         name=loader_fn.name,
                     )
+
                     shared_celltypes: list[str] = np.intersect1d(
-                        ar1=np.array(query.obs[query_ct_key].unique()),  # type: ignore
-                        ar2=np.array(reference.obs[ref_ct_key].unique()),  # type: ignore
+                        ar1=query.obs[query_ct_key]
+                        .value_counts()
+                        .loc[lambda x: x >= config.min_n_cells_celltype]
+                        .index,  # type: ignore
+                        ar2=reference.obs[ref_ct_key]
+                        .value_counts()
+                        .loc[lambda x: x >= config.min_n_cells_celltype]
+                        .index,  # type: ignore
                     ).tolist()
                     shared_features = np.intersect1d(
                         query.var_names, reference.var_names
