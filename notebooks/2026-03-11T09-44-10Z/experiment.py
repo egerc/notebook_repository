@@ -277,11 +277,14 @@ def _create_spatial_loader(
         _adata_dense_mut(query)
         _adata_dense_mut(reference)
 
-        query.obs[query_ct_key] = cached_transfer(
-            query,
-            reference,
-            reference_ct_key,
-        )
+        try:
+            query.obs[query_ct_key]
+        except KeyError:
+            query.obs[query_ct_key] = cached_transfer(
+                query,
+                reference,
+                reference_ct_key,
+            )
         shared_features = np.intersect1d(query.var_names, reference.var_names)
         return (
             query[:, shared_features],
