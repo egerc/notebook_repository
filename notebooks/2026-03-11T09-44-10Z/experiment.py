@@ -20,6 +20,7 @@ from nico2_lib.predictors._scvi._scvi_pred import ScviPredictor
 from numpy import intp, number
 from numpy.typing import NDArray
 from pydantic import BaseModel
+from scipy.sparse import issparse
 from sklearn.decomposition import PCA
 from sklearn.neighbors import kneighbors_graph
 from sqlmodel import (
@@ -104,8 +105,15 @@ class PredictorWrapper:
     predictor: object
 
     def fit(self, X: NumericArray) -> "PredictorWrapper":
-        # Ensure data is float32 and dense
-        data = np.log1p(X) if self.log_transform else X
+        # Check if X is sparse (including SparseCSRMatrixView)
+        if hasattr(X, "toarray"):
+            data = X.toarray()
+        else:
+            data = X
+            
+        if self.log_transform:
+            data = np.log1p(data)
+            
         data = np.asarray(data, dtype=np.float32) 
         return replace(self, predictor=self.predictor.fit(data))
 
@@ -240,8 +248,9 @@ class MockPredictor:
 
 
 def _adata_dense_mut(adata: AnnData) -> None:
-    if hasattr(adata.X, "toarray"):
-        adata.X = adata.X.toarray()  # type: ignore
+    if issparse(adata.X):
+        # .toarray() works on both matrices and views
+        adata.X = adata.X.toarray()
 
 
 def _sample_indices(
