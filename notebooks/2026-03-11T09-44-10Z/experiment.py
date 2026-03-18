@@ -104,14 +104,18 @@ class PredictorWrapper:
     predictor: object
 
     def fit(self, X: NumericArray) -> "PredictorWrapper":
+        # Ensure data is float32 and dense
         data = np.log1p(X) if self.log_transform else X
-        return replace(self, predictor=self.predictor.fit(data))  # type: ignore
+        data = np.asarray(data, dtype=np.float32) 
+        return replace(self, predictor=self.predictor.fit(data))
 
     def predict(
         self, X: NumericArray, idx: IndexArray
     ) -> tuple[NumericArray, NumericArray]:
+        # Ensure data is float32 to match the fitted model
         data = np.log1p(X) if self.log_transform else X
-        return self.predictor.predict(data, idx)  # type: ignore
+        data = np.asarray(data, dtype=np.float32)
+        return self.predictor.predict(data, idx)
 
 
 @dataclass(frozen=True)
