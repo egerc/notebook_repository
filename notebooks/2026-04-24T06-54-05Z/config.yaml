@@ -1,0 +1,27 @@
+n_samples: 3
+sample_length: 20
+max_n_pcs: 25
+max_n_neighbours: 15
+predictors:
+  - name: nmf_3_raw
+    model_architecture: nmf
+    log_transform: False
+    kwargs:
+      n_components: 3
+  - name: nmf_3_log
+    model_architecture: nmf
+    log_transform: True
+    kwargs:
+      n_components: 3
+datasets:
+  - type: spatial
+    name: mouse_intestine_spatial
+    query_path: ../data/mouse_small_intestine_merfish/mouse_small_intestine_merfish.h5ad
+    query_ct_key: "cluster"
+    reference_path: ../data/mouse_small_intestine_sc/mouse_small_intestine_sc.h5ad
+    reference_ct_key: "cluster"
+  - type: pseudospatial
+    name: mouse_intestine_pseudospatial
+    data_path: ../data/mouse_small_intestine_sc/mouse_small_intestine_sc.h5ad
+    data_ct_key: "cluster"
+
