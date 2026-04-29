@@ -1,5 +1,6 @@
 n_samples: 3
 sample_length: 20
+min_n_cells_celltype: 10
 max_n_pcs: 25
 max_n_neighbours: 15
 predictors:
@@ -7,12 +8,12 @@ predictors:
     model_architecture: nmf
     log_transform: False
     kwargs:
-      n_components: 3
+      embedding_size: 3
   - name: nmf_3_log
     model_architecture: nmf
     log_transform: True
     kwargs:
-      n_components: 3
+      embedding_size: 3
 datasets:
   - type: spatial
     name: mouse_intestine_spatial

@@ -16,7 +16,6 @@ import yaml
 from anndata.io import read_h5ad
 from anndata.typing import AnnData
 from joblib import Memory
-from nico2_lib.predictors._scvi._scvi_pred import ScviPredictor
 from numpy import intp, number
 from numpy.typing import NDArray
 from pydantic import BaseModel
@@ -35,7 +34,12 @@ from sqlmodel import (
 )
 from umap import UMAP
 
-ModelArchitecture = Literal["mock", "nmf", "scvi"]
+ModelArchitecture = Literal[
+    "mock",
+    "nmf",
+    "scvi",
+    "mofaflex",
+]
 NumericArray = NDArray[number]
 IndexArray = NDArray[intp]
 LoaderFn = Callable[[], tuple[AnnData, AnnData, str, str]]
@@ -110,11 +114,11 @@ class PredictorWrapper:
             data = X.toarray()
         else:
             data = X
-            
+
         if self.log_transform:
             data = np.log1p(data)
-            
-        data = np.asarray(data, dtype=np.float32) 
+
+        data = np.asarray(data, dtype=np.float32)
         return replace(self, predictor=self.predictor.fit(data))
 
     def predict(
@@ -267,7 +271,8 @@ def _sample_indices(
 PREDICTOR_REGISTRY: dict[ModelArchitecture, n2l.pd.PredictorProtocol] = {  # type: ignore
     "mock_predictor": MockPredictor,
     "nmf": n2l.pd.NmfPredictor,
-    "scvi": ScviPredictor,
+    "scvi": n2l.pd.ScviPredictor,
+    "mofaflex": n2l.pd.MofaFlexPredictor,
 }
 
 
