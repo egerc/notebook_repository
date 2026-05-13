@@ -1,0 +1,17 @@
+n_components: 2
+n_samples: 500
+seed: 0
+n_iterations: 1
+scoring_pipelines:
+  - [null, [cosine_similarity]]
+preprocessing: [identity, log1p]
+database_names:
+  - KEGG_2026
+  - ARCHS4_Cell-lines
+datasets:
+  - filepath: /Users/egerc/Documents/Projects/notebook_repository/notebooks/2026-02-10T09-07-37Z/data/mouse_small_intestine_sc/mouse_small_intestine_sc.h5ad
+    name: mouse_intestine
+    cluster_key: cluster
+    species: mouse
+shuffle_probabilities: [0, 0.2, 0.5, 0.75, 1]
+output_csv_path: output.csv
