@@ -7,4 +7,5 @@ dependencies = [
     "anndata>=0.12.14",
     "numpy>=2.4.4",
     "scikit-learn>=1.8.0",
+    "jupyter>=1.1.1",
 ]
