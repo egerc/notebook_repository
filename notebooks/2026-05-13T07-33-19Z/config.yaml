@@ -2,14 +2,17 @@ n_components: 2
 n_samples: 500
 seed: 0
 n_iterations: 1
-scoring_pipelines:
-  - [null, [cosine_similarity]]
-preprocessing: [identity, log1p]
+scoring_functions:
+  - [null, dominic_scoring]
+  - [pearson, dominic_scoring]
+  - [spearman, dominic_scoring]
+  - [cosine_similarity, dominic_scoring]
+preprocessing: [identity, log1p]    
 database_names:
   - KEGG_2026
   - ARCHS4_Cell-lines
 datasets:
-  - filepath: /Users/egerc/Documents/Projects/notebook_repository/notebooks/2026-02-10T09-07-37Z/data/mouse_small_intestine_sc/mouse_small_intestine_sc.h5ad
+  - filepath: /home/gruengroup/christian/Data/mouse_small_intestine_sc.h5ad
     name: mouse_intestine
     cluster_key: cluster
     species: mouse

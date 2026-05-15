@@ -11,4 +11,5 @@ dependencies = [
     "gseapy>=1.2.1",
     "scanpy>=1.11.2",
     "pydantic>=2.13.4",
+    "pyright>=1.1.409",
 ]

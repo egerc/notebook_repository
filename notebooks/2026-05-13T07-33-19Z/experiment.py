@@ -1,8 +1,9 @@
 import logging
 from collections.abc import Mapping, Sequence
-from functools import reduce
+from functools import cache, reduce
 from itertools import product
 from pathlib import Path
+from time import sleep
 from typing import Any, Callable, Literal
 
 import gseapy
@@ -11,6 +12,7 @@ import numpy as np
 import yaml
 from anndata import read_h5ad
 from anndata.typing import AnnData
+from joblib import Memory
 from nico2_lib.typing import NumericArray
 from pydantic import (
     ConfigDict,
@@ -23,12 +25,13 @@ from pydantic import (
 from pydantic.dataclasses import dataclass
 from sklearn.decomposition import non_negative_factorization
 from sklearn.metrics.pairwise import cosine_similarity
-from toolz import compose
 from tqdm import tqdm
+
+memory = Memory("./cache")
 
 PreprocessingNames = Literal["identity", "log1p"]
 CorrelationNames = Literal["pearson", "spearman", "cosine_similarity"]
-ScoringFunctionNames = Literal["cosine_similarity"]
+ScoringFunctionNames = Literal["dominic_scoring"]
 GeneProgramsDB = frozenset[tuple[str, frozenset[str]]]
 DatabaseName = Literal[
     "ARCHS4_Cell-lines",
@@ -286,7 +289,9 @@ class DatasetInfo:
             return v
         valid_columns: list[str] = read_h5ad(filepath, backed="r").obs.columns.tolist()
         if v not in valid_columns:
-            raise ValueError(f"cluster_key {v} is not in obs columns")
+            raise ValueError(
+                f"cluster_key {v} is not in obs columns, must be one of {valid_columns}"
+            )
 
         return v
 
@@ -307,9 +312,7 @@ class Config:
     preprocessing: Sequence[PreprocessingNames]
     database_names: Sequence[DatabaseName]
     datasets: Sequence[DatasetInfo]
-    scoring_pipelines: Sequence[
-        tuple[CorrelationNames | None, Sequence[ScoringFunctionNames]]
-    ]
+    scoring_functions: Sequence[tuple[CorrelationNames | None, ScoringFunctionNames]]
     shuffle_probabilities: Sequence[NonNegativeFloat]
     output_csv_path: str
 
@@ -368,6 +371,16 @@ def add_shuffle_noise_dense(
     )
 
 
+def gini(arr: NumericArray) -> float:
+    """Compute Gini coefficient of a 1D array."""
+    if np.amin(arr) < 0:
+        arr -= np.amin(arr)  # Values must be non-negative
+    arr = np.sort(arr)
+    index = np.arange(1, arr.shape[0] + 1)
+    n = arr.shape[0]
+    return float((np.sum((2 * index - n - 1) * arr)) / (n * np.sum(arr)))
+
+
 def factor_gene_correlations(
     x: NumericArray,
     w: NumericArray,
@@ -384,14 +397,85 @@ def factor_gene_correlations(
     ).T
 
 
+@memory.cache
+def gseapy_enrichr(
+    gene_list: tuple[str, ...],
+    gene_sets: str,
+    max_retries: int = 5,
+) -> gseapy.Enrichr:
+    """Run gseapy enrichr on a gene list and gene sets, returning the result.
+
+    Retries up to max_retries times in case of network/API errors.
+    """
+    attempts = 0
+
+    while attempts < max_retries:
+        try:
+            result = gseapy.enrichr(
+                gene_list=list(gene_list),
+                gene_sets=gene_sets,
+            )
+            return result
+
+        except Exception as e:
+            attempts += 1
+            logging.warning(
+                f"Attempt {attempts}/{max_retries} failed to enrichr gene list. Error: {e}"
+            )
+
+            if attempts >= max_retries:
+                logging.error("Max retries reached. Raising exception.")
+                raise e
+
+            sleep(60)
+
+
+def dominic_scoring(
+    gene_list: Sequence[str],
+    factor_gene_loadings: NumericArray,
+    database_name: DatabaseName,
+    gene_program_counts: NumericArray,
+) -> float:
+    n_genes = min(len(gene_list), 10)
+    list_of_gene_lists: list[list[str]] = [
+        [gene_list[i] for i in np.argpartition(factor, -n_genes)[-10:]]
+        for factor in factor_gene_loadings
+    ]
+    scores = [
+        float(
+            gseapy_enrichr(
+                gene_list=tuple(gene_list),
+                gene_sets=database_name,
+            )
+            .results.sort_values(by="Adjusted P-value")
+            .iloc[0]["Adjusted P-value"]
+        )
+        for gene_list in list_of_gene_lists
+    ]
+    return float(np.mean(scores))
+
+
+def cosine_and_gini(
+    adata: AnnData,
+    factor_gene_loadings: NumericArray,
+    database_name: DatabaseName,
+    gene_program_counts: NumericArray,
+) -> float:
+    a = cosine_similarity(factor_gene_loadings, gene_program_counts)
+    return gini(a)
+
+
 _PREPROCESSING_REGISTRY: Mapping[
     PreprocessingNames, Callable[[NumericArray], NumericArray]
 ] = {
     "identity": lambda x: x,
     "log1p": np.log1p,
 }
-_SCORING_PIPELINE_REGISTRY: Mapping[ScoringFunctionNames, Callable[..., Any]] = {
-    "cosine_similarity": cosine_similarity
+_SCORING_REGISTRY: Mapping[
+    ScoringFunctionNames,
+    Callable[[Sequence[str], NumericArray, DatabaseName, NumericArray], float],
+] = {
+    "dominic_scoring": dominic_scoring,
 }
 
 _CORRELATION_REGISTRY: Mapping[
@@ -401,21 +485,6 @@ _CORRELATION_REGISTRY: Mapping[
     "spearman": n2l.mt.spearman_metric,
     "cosine_similarity": n2l.mt.cosine_similarity_metric,
 }
-
-
-def dominic_scoring(
-    adata: AnnData,
-    factor_gene_loadings: NumericArray,
-    database_name: DatabaseName,
-) -> float:
-    gene_list: list[str] = adata.var_names[
-        np.argpartition(factor_gene_loadings, -10)[-10:]
-    ].tolist()
-    df_enrichment = gseapy.enrichr(
-        gene_list=gene_list,
-        database=database_name,
-    )
-    return df_enrichment.sort_values(by="Adjusted P-value").iloc[0]["Adjusted P-value"]
 
 
 def main():
@@ -430,7 +499,7 @@ def main():
     logger.info("Loading config")
     with open("./config.yaml") as f:
         config = Config(**yaml.safe_load(f))
-    return 0
+    # return 0
     rng = np.random.default_rng(config.seed)
 
     logger.info("Starting main loop")
@@ -471,12 +540,14 @@ def main():
                 )
                 for preprocessing_name in config.preprocessing:
                     preprocessing_func = _PREPROCESSING_REGISTRY[preprocessing_name]
-                    w, h, _ = non_negative_factorization(
+                    w: NumericArray
+                    h: NumericArray
+                    w, h, _ = non_negative_factorization(  # type: ignore
                         X=preprocessing_func(noisy_counts),
                         n_components=config.n_components,  # type: ignore
                     )
-                    for scoring_pipeline in config.scoring_pipelines:
-                        correlation_name, scoring_function_names = scoring_pipeline
+                    for scoring_function in config.scoring_functions:
+                        correlation_name, scoring_function_name = scoring_function
                         factor_gene_loadings = (
                             factor_gene_correlations(
                                 x=noisy_counts,
@@ -485,6 +556,20 @@ def main():
                             )
                             if correlation_name is not None
                             else h
+                        )
+                        # return (
+                        #    adata,
+                        #    gene_list,
+                        #    factor_gene_loadings,
+                        #    database_name,
+                        #    gene_program_counts,
+                        #    dataset,
+                        # )
+                        score = _SCORING_REGISTRY[scoring_function_name](
+                            sorted(gene_list),
+                            factor_gene_loadings,
+                            database_name,
+                            gene_program_counts,
                         )
 
 

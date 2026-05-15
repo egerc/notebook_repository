@@ -1,1 +1,1 @@
-Experiment to discover a way to quantify the biological enrichment of cell embeddings
+Experiment to discover a way to quantify the biological enrichment of cell embeddings using prior knowledge gene programs
