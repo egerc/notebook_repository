@@ -1,10 +1,10 @@
 import logging
 from collections.abc import Mapping, Sequence
-from functools import cache, reduce
+from functools import reduce
 from itertools import product
 from pathlib import Path
 from time import sleep
-from typing import Any, Callable, Literal
+from typing import Callable, Literal
 
 import gseapy
 import nico2_lib as n2l
@@ -23,7 +23,9 @@ from pydantic import (
     field_validator,
 )
 from pydantic.dataclasses import dataclass
+from scipy.stats import hypergeom
 from sklearn.decomposition import non_negative_factorization
+from sklearn.feature_selection import mutual_info_regression
 from sklearn.metrics.pairwise import cosine_similarity
 from tqdm import tqdm
 
@@ -31,7 +33,12 @@ memory = Memory("./cache")
 
 PreprocessingNames = Literal["identity", "log1p"]
 CorrelationNames = Literal["pearson", "spearman", "cosine_similarity"]
-ScoringFunctionNames = Literal["dominic_scoring"]
+ScoringFunctionNames = Literal[
+    "dominic_scoring",
+    "hypergeometric_max_enrichment_scoring",
+    "max_cosine_alignment_scoring",
+    "mutual_information_pathway_scoring",
+]
 GeneProgramsDB = frozenset[tuple[str, frozenset[str]]]
 DatabaseName = Literal[
     "ARCHS4_Cell-lines",
@@ -455,6 +462,107 @@ def dominic_scoring(
     return float(np.mean(scores))
 
 
+def hypergeometric_max_enrichment_scoring(
+    gene_list: Sequence[str],
+    factor_gene_loadings: NumericArray,
+    database_name: DatabaseName,
+    gene_program_counts: NumericArray,
+) -> float:
+    """Calculate the average top log p-value using a hypergeometric test.
+
+    Reasoning:
+        Unlike GSEA-based methods (like Dominic scoring), this method strips away
+        the specific rank weight and looks strictly at set intersection. By defining
+        a threshold for the top-loaded genes in each NMF factor, we can compute an
+        exact hypergeometric p-value across all programs in the database.
+
+        Taking the negative log10 of the minimum p-value for each factor reveals
+        whether that factor successfully condensed into *at least one* highly
+        coherent, recognizable prior biological pathway or gene program. Higher scores
+        indicate more robust biological alignment.
+    """
+
+    _, n_genes = gene_program_counts.shape
+
+    top_k = min(n_genes, 30)
+    M = n_genes
+    n_successes_per_program = np.sum(
+        gene_program_counts, axis=1
+    )  # Shape: (n_programs,)
+
+    factor_scores = []
+
+    for factor in factor_gene_loadings:
+        top_gene_indices = np.argpartition(factor, -top_k)[-top_k:]
+        hits_per_program = np.sum(gene_program_counts[:, top_gene_indices], axis=1)
+        p_values = hypergeom.sf(hits_per_program - 1, M, n_successes_per_program, top_k)
+        p_values = np.clip(p_values, 1e-300, 1.0)
+        neg_log_p = -np.log10(p_values)
+        factor_scores.append(np.max(neg_log_p))
+    return float(np.mean(factor_scores))
+
+
+def max_cosine_alignment_scoring(
+    gene_list: Sequence[str],
+    factor_gene_loadings: NumericArray,
+    database_name: DatabaseName,
+    gene_program_counts: NumericArray,
+) -> float:
+    """Calculate the average maximum cosine similarity between factors and databases.
+
+    Reasoning:
+        Dominic scoring relies on API hits and hard boundaries (top 10 genes), which
+        discards the nuances of sub-dominant gene weights. This function compares the
+        entire continuous vector of factor weights against the ground-truth binary vectors
+        of the gene database using cosine similarity.
+
+        By identifying the maximum cosine similarity score for each factor against
+        the database, we measure how well the continuous distribution matches the
+        shape of known biological modules without losing information to arbitrary thresholds.
+        It scales beautifully from 0 to 1 and requires zero network requests.
+    """
+    similarity_matrix = cosine_similarity(factor_gene_loadings, gene_program_counts)
+    max_similarities = np.max(similarity_matrix, axis=1)
+    return float(np.mean(max_similarities))
+
+
+def mutual_information_pathway_scoring(
+    gene_list: Sequence[str],
+    factor_gene_loadings: NumericArray,
+    database_name: DatabaseName,
+    gene_program_counts: NumericArray,
+) -> float:
+    """Evaluate alignment via average maximum Mutual Information.
+
+    Reasoning:
+        Cosine similarity assumes a linear relationship, but biological pathway
+        co-expression patterns are often non-linear or feature heavy-tailed step functions.
+        Mutual Information (MI) quantifies the total amount of information shared
+        between the continuous factor loadings and the binary pathway target assignments.
+
+        A high MI score means that knowing the factor loading value of a random gene
+        gives you massive predictive certainty about whether that gene belongs to the
+        given database pathway. It effectively captures structural dependencies
+        that standard correlation metrics miss.
+    """
+
+    factor_max_mi = []
+
+    for factor in factor_gene_loadings:
+        max_mi_for_factor = 0.0
+
+        for program_vector in gene_program_counts:
+            X = factor.reshape(-1, 1)
+            y = program_vector
+            mi = mutual_info_regression(X, y, discrete_features=[True])[0]
+            if mi > max_mi_for_factor:
+                max_mi_for_factor = mi
+
+        factor_max_mi.append(max_mi_for_factor)
+
+    return float(np.mean(factor_max_mi))
+
+
 def cosine_and_gini(
     adata: AnnData,
     factor_gene_loadings: NumericArray,
@@ -476,6 +584,9 @@ _SCORING_REGISTRY: Mapping[
     Callable[[Sequence[str], NumericArray, DatabaseName, NumericArray], float],
 ] = {
     "dominic_scoring": dominic_scoring,
+    "hypergeometric_max_enrichment_scoring": hypergeometric_max_enrichment_scoring,
+    "max_cosine_alignment_scoring": max_cosine_alignment_scoring,
+    "mutual_information_pathway_scoring": mutual_information_pathway_scoring,
 }
 
 _CORRELATION_REGISTRY: Mapping[
@@ -523,6 +634,7 @@ def main():
                 f"No genes found in gene program database {database_name}, Skipping"
             )
             continue
+        adata.var_names = adata.var_names.astype(str).str.upper()
         gene_list: list[str] = np.intersect1d(
             adata.var_names,
             gene_program_db_genes,
@@ -571,6 +683,11 @@ def main():
                             database_name,
                             gene_program_counts,
                         )
+                        result = {
+                            scoring_function_name: scoring_function_name,
+                            correlation_name: correlation_name,
+                            score: score,
+                        }
 
 
 if __name__ == "__main__":

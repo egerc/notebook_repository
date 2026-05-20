@@ -7,14 +7,26 @@ scoring_functions:
   - [pearson, dominic_scoring]
   - [spearman, dominic_scoring]
   - [cosine_similarity, dominic_scoring]
+  - [null, hypergeometric_max_enrichment_scoring]
+  - [pearson, hypergeometric_max_enrichment_scoring]
+  - [spearman, hypergeometric_max_enrichment_scoring]
+  - [cosine_similarity, hypergeometric_max_enrichment_scoring]
+  - [null, max_cosine_alignment_scoring]
+  - [pearson, max_cosine_alignment_scoring]
+  - [spearman, max_cosine_alignment_scoring]
+  - [cosine_similarity, max_cosine_alignment_scoring]
+  - [null, mutual_information_pathway_scoring]
+  - [pearson, mutual_information_pathway_scoring]
+  - [spearman, mutual_information_pathway_scoring]
+  - [cosine_similarity, mutual_information_pathway_scoring]
 preprocessing: [identity, log1p]    
 database_names:
   - KEGG_2026
   - ARCHS4_Cell-lines
 datasets:
-  - filepath: /home/gruengroup/christian/Data/mouse_small_intestine_sc.h5ad
-    name: mouse_intestine
-    cluster_key: cluster
+  - filepath: /home/gruengroup/christian/Data/benchmark_sample_data/andy_reference_downsampled.h5ad
+    name: andy_reference
+    cluster_key: simple_annot
     species: mouse
 shuffle_probabilities: [0, 0.2, 0.5, 0.75, 1]
 output_csv_path: output.csv
