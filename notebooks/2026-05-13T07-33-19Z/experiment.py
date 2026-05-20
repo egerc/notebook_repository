@@ -4,11 +4,12 @@ from functools import reduce
 from itertools import product
 from pathlib import Path
 from time import sleep
-from typing import Callable, Literal
+from typing import Any, Callable, Literal
 
 import gseapy
 import nico2_lib as n2l
 import numpy as np
+import pandas as pd
 import yaml
 from anndata import read_h5ad
 from anndata.typing import AnnData
@@ -615,6 +616,7 @@ def main():
 
     logger.info("Starting main loop")
     n_total_iterations = len(config.datasets) * len(config.database_names)
+    all_results: list[dict[str, Any]] = []
     for dataset, database_name in tqdm(
         product(
             config.datasets,
@@ -669,25 +671,27 @@ def main():
                             if correlation_name is not None
                             else h
                         )
-                        # return (
-                        #    adata,
-                        #    gene_list,
-                        #    factor_gene_loadings,
-                        #    database_name,
-                        #    gene_program_counts,
-                        #    dataset,
-                        # )
                         score = _SCORING_REGISTRY[scoring_function_name](
                             sorted(gene_list),
                             factor_gene_loadings,
                             database_name,
                             gene_program_counts,
                         )
-                        result = {
-                            scoring_function_name: scoring_function_name,
-                            correlation_name: correlation_name,
-                            score: score,
-                        }
+                        all_results.append(
+                            {
+                                "dataset_name": dataset.name,
+                                "database_name": database_name,
+                                "cluster_name": cluster_name,
+                                "shuffle_probability": shuffle_probability,
+                                "preprocessing_name": preprocessing_name,
+                                "scoring_function_name": scoring_function_name,
+                                "correlation_name": correlation_name,
+                                "score": score,
+                            }
+                        )
+                        pd.concat([pd.DataFrame(all_results)]).to_csv(
+                            config.output_csv_path
+                        )
 
 
 if __name__ == "__main__":
