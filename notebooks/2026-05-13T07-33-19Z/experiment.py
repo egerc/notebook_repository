@@ -1,4 +1,5 @@
 import logging
+import socket
 from collections.abc import Mapping, Sequence
 from functools import reduce
 from itertools import product
@@ -411,11 +412,13 @@ def gseapy_enrichr(
     gene_sets: str,
     max_retries: int = 5,
 ) -> gseapy.Enrichr:
-    """Run gseapy enrichr on a gene list and gene sets, returning the result.
-
-    Retries up to max_retries times in case of network/API errors.
-    """
+    """Run gseapy enrichr with strict timeouts and exponential backoff."""
     attempts = 0
+    base_delay = 30  # Start with a 30-second delay
+
+    # Set global socket timeout to prevent the underlying network requests
+    # from hanging into infinity if the server drops the socket.
+    socket.setdefaulttimeout(30)
 
     while attempts < max_retries:
         try:
@@ -427,15 +430,20 @@ def gseapy_enrichr(
 
         except Exception as e:
             attempts += 1
+
+            # Calculate exponential backoff with a bit of random noise (jitter)
+            # Attempt 1: ~30-40s, Attempt 2: ~60-70s, Attempt 3: ~120-130s...
+            sleep_time = (base_delay * (2 ** (attempts - 1))) + np.random.uniform(1, 10)
+
             logging.warning(
-                f"Attempt {attempts}/{max_retries} failed to enrichr gene list. Error: {e}"
+                f"Attempt {attempts}/{max_retries} failed. Retrying in {sleep_time:.1f}s. Error: {e}"
             )
 
             if attempts >= max_retries:
                 logging.error("Max retries reached. Raising exception.")
                 raise e
 
-            sleep(60)
+            sleep(sleep_time)
 
 
 def dominic_scoring(
@@ -671,6 +679,9 @@ def main():
                             if correlation_name is not None
                             else h
                         )
+                        factor_gene_loadings = np.nan_to_num(
+                            factor_gene_loadings, nan=0.0
+                        )
                         score = _SCORING_REGISTRY[scoring_function_name](
                             sorted(gene_list),
                             factor_gene_loadings,
@@ -685,7 +696,9 @@ def main():
                                 "shuffle_probability": shuffle_probability,
                                 "preprocessing_name": preprocessing_name,
                                 "scoring_function_name": scoring_function_name,
-                                "correlation_name": correlation_name,
+                                "correlation_name": correlation_name
+                                if correlation_name is not None
+                                else "None",
                                 "score": score,
                             }
                         )

@@ -23,6 +23,14 @@ preprocessing: [identity, log1p]
 database_names:
   - KEGG_2026
   - ARCHS4_Cell-lines
+  - DSigDB
+  - GO_Biological_Process_2025
+  - GO_Cellular_Component_2026
+  - GO_Molecular_Function_2026
+  - GeneSigDB
+  - PerturbAtlas
+  - Reactome_Pathways_2024
+  - WikiPathways_2016
 datasets:
   - filepath: /home/gruengroup/christian/Data/benchmark_sample_data/andy_reference_downsampled.h5ad
     name: andy_reference
