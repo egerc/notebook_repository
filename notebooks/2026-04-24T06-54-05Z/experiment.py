@@ -1,6 +1,8 @@
 import os
 import pickle
 import tempfile
+from argparse import ArgumentParser, Namespace
+from collections.abc import Sequence
 from dataclasses import dataclass, replace
 from enum import Enum
 from functools import partial, reduce
@@ -21,6 +23,7 @@ from numpy.typing import NDArray
 from pydantic import BaseModel
 from scipy.sparse import issparse
 from sklearn.decomposition import PCA
+from sklearn.metrics.pairwise import cosine_similarity
 from sklearn.neighbors import kneighbors_graph
 from sqlmodel import (
     Column,
@@ -43,6 +46,7 @@ ModelArchitecture = Literal[
 NumericArray = NDArray[number]
 IndexArray = NDArray[intp]
 LoaderFn = Callable[[], tuple[AnnData, AnnData, str, str]]
+GeneProgramsDB = frozenset[tuple[str, frozenset[str]]]
 
 
 class SpatialInputDataset(BaseModel):
@@ -74,11 +78,12 @@ class Config(BaseModel):
     min_n_cells_celltype: int
     max_n_pcs: int
     max_n_neighbours: int
-    predictors: list[Predictor]
+    predictors: list[Predictor | None]
     datasets: list[
         Annotated[
             SpatialInputDataset | PseudospatialInputDataset, Field(discriminator="type")
         ]
+        | None
     ]
 
 
@@ -94,7 +99,7 @@ class PklType(TypeDecorator):
     def process_result_value(self, value, dialect):
         # if value is not None:
         #    return pickle.loads(value)
-        return pickle.loads(value)
+        return pickle.loads(value)  # type: ignore
 
 
 class ModalityEnum(str, Enum):
@@ -106,12 +111,12 @@ class ModalityEnum(str, Enum):
 class PredictorWrapper:
     name: str
     log_transform: bool
-    predictor: object
+    predictor: n2l.pd.PredictorProtocol
 
     def fit(self, X: NumericArray) -> "PredictorWrapper":
         # Check if X is sparse (including SparseCSRMatrixView)
         if hasattr(X, "toarray"):
-            data = X.toarray()
+            data = X.toarray()  # type: ignore
         else:
             data = X
 
@@ -254,7 +259,7 @@ class MockPredictor:
 def _adata_dense_mut(adata: AnnData) -> None:
     if issparse(adata.X):
         # .toarray() works on both matrices and views
-        adata.X = adata.X.toarray()
+        adata.X = adata.X.toarray()  # type: ignore
 
 
 def _sample_indices(
@@ -268,8 +273,41 @@ def _sample_indices(
     return train_idx, test_idx
 
 
+def get_gene_program_counts(
+    gene_programs_db: GeneProgramsDB,
+    genes: Sequence[str],
+) -> NumericArray:
+    binary_matrix = [
+        [1 if gene in program_genes else 0 for gene in genes]
+        for _, program_genes in gene_programs_db
+    ]
+    return np.array(binary_matrix)
+
+
+def max_cosine_alignment_scoring(
+    factor_gene_loadings: NumericArray,
+    gene_program_counts: NumericArray,
+) -> float:
+    """Calculate the average maximum cosine similarity between factors and databases.
+
+    Reasoning:
+        Dominic scoring relies on API hits and hard boundaries (top 10 genes), which
+        discards the nuances of sub-dominant gene weights. This function compares the
+        entire continuous vector of factor weights against the ground-truth binary vectors
+        of the gene database using cosine similarity.
+
+        By identifying the maximum cosine similarity score for each factor against
+        the database, we measure how well the continuous distribution matches the
+        shape of known biological modules without losing information to arbitrary thresholds.
+        It scales beautifully from 0 to 1 and requires zero network requests.
+    """
+    similarity_matrix = cosine_similarity(factor_gene_loadings, gene_program_counts)
+    max_similarities = np.max(similarity_matrix, axis=1)
+    return float(np.mean(max_similarities))
+
+
 PREDICTOR_REGISTRY: dict[ModelArchitecture, n2l.pd.PredictorProtocol] = {  # type: ignore
-    "mock_predictor": MockPredictor,
+    "mock": MockPredictor,
     "nmf": n2l.pd.NmfPredictor,
     "scvi": n2l.pd.ScviPredictor,
     "mofaflex": n2l.pd.MofaFlexPredictor,
@@ -358,8 +396,15 @@ def loader_config_to_loader(
             )
 
 
+def parse_args() -> Namespace:
+    parser = ArgumentParser()
+    parser.add_argument("config", type=str, help="Path to the config file")
+    return parser.parse_args()
+
+
 def main():
-    with open("config.yaml", "r") as f:
+    args = parse_args()
+    with open(args.config, "r") as f:
         yaml_config = yaml.safe_load(f)
     config = Config(**yaml_config)
     memory = Memory("cache")
@@ -368,6 +413,7 @@ def main():
     loader_fns: list[LoaderFnWrapper] = [
         loader_config_to_loader(loader_config, memory=memory)
         for loader_config in config.datasets
+        if loader_config is not None
     ]
 
     predictors: list[PredictorWrapper] = [
@@ -379,6 +425,7 @@ def main():
             ),
         )
         for predictor_config in config.predictors
+        if predictor_config is not None
     ]
 
     with mlflow.start_run():  # type: ignore
@@ -477,19 +524,21 @@ def main():
                                 reference_counts_matrix
                             )
                         )
-                        query_umap_embedding: NumericArray = UMAP(
+                        query_umap_embedding: NumericArray = UMAP(  # type: ignore
+                            n_components=2  # type: ignore
+                        ).fit_transform(query_pca_embedding)  # type: ignore
+                        reference_umap_embedding: NumericArray = UMAP(
                             n_components=2
-                        ).fit_transform(query_pca_embedding)
-                        reference_umap_embedding = UMAP(n_components=2).fit_transform(
+                        ).fit_transform(  # type: ignore
                             reference_pca_embedding
                         )
                         n_neighbours = reduce(min, [config.max_n_neighbours, n_pcs])
                         if n_pcs == n_neighbours:
                             n_neighbours -= 1
-                        query_adjacency_matrix: NumericArray = kneighbors_graph(
+                        query_adjacency_matrix: NumericArray = kneighbors_graph(  # type: ignore
                             query_pca_embedding, n_neighbors=n_neighbours
                         )
-                        reference_adjacency_matrix = kneighbors_graph(
+                        reference_adjacency_matrix: NumericArray = kneighbors_graph(  # type: ignore
                             reference_pca_embedding, n_neighbors=n_neighbours
                         )
 
