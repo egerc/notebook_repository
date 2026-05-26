@@ -446,6 +446,7 @@ def gseapy_enrichr(
             sleep(sleep_time)
 
 
+@memory.cache
 def dominic_scoring(
     gene_list: Sequence[str],
     factor_gene_loadings: NumericArray,
@@ -471,6 +472,7 @@ def dominic_scoring(
     return float(np.mean(scores))
 
 
+@memory.cache
 def hypergeometric_max_enrichment_scoring(
     gene_list: Sequence[str],
     factor_gene_loadings: NumericArray,
@@ -511,6 +513,7 @@ def hypergeometric_max_enrichment_scoring(
     return float(np.mean(factor_scores))
 
 
+@memory.cache
 def max_cosine_alignment_scoring(
     gene_list: Sequence[str],
     factor_gene_loadings: NumericArray,
@@ -535,6 +538,7 @@ def max_cosine_alignment_scoring(
     return float(np.mean(max_similarities))
 
 
+@memory.cache
 def mutual_information_pathway_scoring(
     gene_list: Sequence[str],
     factor_gene_loadings: NumericArray,

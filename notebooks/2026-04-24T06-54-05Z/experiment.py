@@ -68,7 +68,7 @@ class PseudospatialInputDataset(BaseModel):
 class Predictor(BaseModel):
     name: str
     log_transform: bool
-    model_architecture: str
+    model_architecture: ModelArchitecture
     kwargs: dict[str, Any]
 
 
@@ -241,19 +241,30 @@ def mock_loader() -> tuple[AnnData, AnnData, str, str]:
 
 @dataclass(frozen=True)
 class MockPredictor:
-    n_components: int
+    embedding_size: int
+    seed: int | None = None
+
+    _gene_embeddings: NumericArray | None = None
 
     def fit(self, X: NumericArray) -> "MockPredictor":
-        return replace(self)
+        rng = np.random.default_rng(self.seed)
+        _, n_vars = X.shape
+        gene_embeddings = rng.normal(loc=0, scale=1, size=(self.embedding_size, n_vars))
+
+        return replace(
+            self,
+            _gene_embeddings=gene_embeddings,
+        )
 
     def predict(
         self, X: NumericArray, idx: IndexArray
     ) -> tuple[NumericArray, NumericArray]:
-        rng = np.random.default_rng(0)
+        assert self._gene_embeddings is not None, "fit must be called before predict"
+        rng = np.random.default_rng(self.seed)
         n_obs, _ = X.shape
-        embeddings = rng.normal(loc=0, scale=1, size=(n_obs, self.n_components))
-        reconstructed_counts = rng.normal(loc=0, scale=1, size=X.shape)
-        return embeddings, reconstructed_counts
+        cell_embeddings = rng.normal(loc=0, scale=1, size=(n_obs, self.embedding_size))
+        reconstructed_counts = cell_embeddings @ self._gene_embeddings
+        return cell_embeddings, reconstructed_counts
 
 
 def _adata_dense_mut(adata: AnnData) -> None:
