@@ -15,6 +15,7 @@ dependencies = [
     { name = "gseapy" },
     { name = "jupyter" },
     { name = "mlflow" },
+    { name = "nbformat" },
     { name = "nico2-lib" },
     { name = "numpy" },
     { name = "plotly" },
@@ -31,6 +32,7 @@ requires-dist = [
     { name = "gseapy", specifier = ">=1.2.1" },
     { name = "jupyter", specifier = ">=1.1.1" },
     { name = "mlflow", specifier = ">=3.11.1" },
+    { name = "nbformat", specifier = ">=5.10.4" },
     { name = "nico2-lib", git = "https://github.com/gruenlab/bioinfo-tools.git?subdirectory=applications%2Fnico2_lib&rev=6bc569e134b8ba05e7faf13719bd67ba8cd58e1f" },
     { name = "numpy", specifier = ">=2.4.4" },
     { name = "plotly", specifier = ">=6.7.0" },
@@ -1738,6 +1740,8 @@ wheels = [
 ]
 
 [[package]]
+<<<<<<< HEAD
+=======
 name = "json5"
 version = "0.14.0"
 source = { registry = "https://pypi.org/simple" }
@@ -1756,6 +1760,7 @@ wheels = [
 ]
 
 [[package]]
+>>>>>>> refs/remotes/origin/main
 name = "jsonschema"
 version = "4.26.0"
 source = { registry = "https://pypi.org/simple" }
@@ -1770,6 +1775,8 @@ wheels = [
     { url = "https://files.pythonhosted.org/packages/69/90/f63fb5873511e014207a475e2bb4e8b2e570d655b00ac19a9a0ca0a385ee/jsonschema-4.26.0-py3-none-any.whl", hash = "sha256:d489f15263b8d200f8387e64b4c3a75f06629559fb73deb8fdfb525f2dab50ce", size = 90630, upload-time = "2026-01-07T13:41:05.306Z" },
 ]
 
+<<<<<<< HEAD
+=======
 [package.optional-dependencies]
 format-nongpl = [
     { name = "fqdn" },
@@ -1783,6 +1790,7 @@ format-nongpl = [
     { name = "webcolors" },
 ]
 
+>>>>>>> refs/remotes/origin/main
 [[package]]
 name = "jsonschema-specifications"
 version = "2025.9.1"
@@ -1796,6 +1804,8 @@ wheels = [
 ]
 
 [[package]]
+<<<<<<< HEAD
+=======
 name = "jupyter"
 version = "1.1.1"
 source = { registry = "https://pypi.org/simple" }
@@ -1813,6 +1823,7 @@ wheels = [
 ]
 
 [[package]]
+>>>>>>> refs/remotes/origin/main
 name = "jupyter-client"
 version = "8.8.0"
 source = { registry = "https://pypi.org/simple" }

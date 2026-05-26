@@ -76,6 +76,7 @@ class Config(BaseModel):
     n_samples: int = Field(ge=1)
     sample_length: int = Field(ge=1)
     min_n_cells_celltype: int
+    n_cells: int | None
     max_n_pcs: int
     max_n_neighbours: int
     predictors: list[Predictor | None]
@@ -273,6 +274,17 @@ def _adata_dense_mut(adata: AnnData) -> None:
         adata.X = adata.X.toarray()  # type: ignore
 
 
+def _subsample_adata(
+    adata: AnnData,
+    n_cells: int | None,
+    rng: np.random.Generator,
+) -> AnnData:
+    if n_cells is not None and adata.n_obs > n_cells:
+        indices = rng.choice(adata.n_obs, size=n_cells, replace=False)
+        adata = adata[indices].copy()
+    return adata
+
+
 def _sample_indices(
     total_features: int,
     n_samples: int,
@@ -456,6 +468,16 @@ def main():
                 }
                 for loader_fn in loader_fns:
                     query, reference, query_ct_key, ref_ct_key = loader_fn.loader()
+                    query = _subsample_adata(
+                        query,
+                        config.n_cells,
+                        rng,
+                    )
+                    reference = _subsample_adata(
+                        reference,
+                        config.n_cells,
+                        rng,
+                    )
                     dataset = Dataset(
                         name=loader_fn.name,
                     )
