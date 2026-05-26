@@ -212,3 +212,4 @@ data
 cache
 mlruns
 *.db
+*test*
