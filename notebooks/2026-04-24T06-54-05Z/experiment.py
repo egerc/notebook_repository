@@ -1,3 +1,4 @@
+import logging
 import os
 import pickle
 import tempfile
@@ -37,12 +38,7 @@ from sqlmodel import (
 )
 from umap import UMAP
 
-ModelArchitecture = Literal[
-    "mock",
-    "nmf",
-    "scvi",
-    "mofaflex",
-]
+ModelArchitecture = Literal["mock", "nmf", "scvi", "mofaflex", "pca"]
 NumericArray = NDArray[number]
 IndexArray = NDArray[intp]
 LoaderFn = Callable[[], tuple[AnnData, AnnData, str, str]]
@@ -124,7 +120,7 @@ class PredictorWrapper:
         if self.log_transform:
             data = np.log1p(data)
 
-        data = np.asarray(data, dtype=np.float32)
+        data = np.asarray(data, dtype=np.float64)
         return replace(self, predictor=self.predictor.fit(data))
 
     def predict(
@@ -132,8 +128,12 @@ class PredictorWrapper:
     ) -> tuple[NumericArray, NumericArray]:
         # Ensure data is float32 to match the fitted model
         data = np.log1p(X) if self.log_transform else X
-        data = np.asarray(data, dtype=np.float32)
+        data = np.asarray(data, dtype=np.float64)
         return self.predictor.predict(data, idx)
+
+    @property
+    def feature_embedding(self) -> NumericArray | None:
+        return self.predictor.feature_embedding
 
 
 @dataclass(frozen=True)
@@ -146,6 +146,8 @@ class Dataset(SQLModel, table=True):
     id: int | None = Field(default=None, primary_key=True)
 
     name: str
+    shared_celltypes: list[str] = Field(sa_column=Column(PklType))
+    shared_features: list[str] = Field(sa_column=Column(PklType))
 
     celltypes: list["Celltype"] = Relationship(back_populates="dataset")
     samples: list["Sample"] = Relationship(back_populates="dataset")
@@ -201,6 +203,8 @@ class Result(SQLModel, table=True):
     model_config = {"arbitrary_types_allowed": True}
     id: int | None = Field(default=None, primary_key=True)
 
+    global_model_feature_embedding: NumericArray = Field(sa_column=Column(PklType))
+    celltype_model_feature_embedding: NumericArray = Field(sa_column=Column(PklType))
     global_model_embedding_reference: NumericArray = Field(sa_column=Column(PklType))
     global_model_counts_reference: NumericArray = Field(sa_column=Column(PklType))
     celltype_model_embedding_reference: NumericArray = Field(sa_column=Column(PklType))
@@ -266,6 +270,13 @@ class MockPredictor:
         cell_embeddings = rng.normal(loc=0, scale=1, size=(n_obs, self.embedding_size))
         reconstructed_counts = cell_embeddings @ self._gene_embeddings
         return cell_embeddings, reconstructed_counts
+
+    @property
+    def feature_embedding(self) -> NumericArray | None:
+        assert self._gene_embeddings is not None, (
+            "fit must be called before feature_embeddings"
+        )
+        return self._gene_embeddings
 
 
 def _adata_dense_mut(adata: AnnData) -> None:
@@ -334,6 +345,7 @@ PREDICTOR_REGISTRY: dict[ModelArchitecture, n2l.pd.PredictorProtocol] = {  # typ
     "nmf": n2l.pd.NmfPredictor,
     "scvi": n2l.pd.ScviPredictor,
     "mofaflex": n2l.pd.MofaFlexPredictor,
+    "pca": n2l.pd.PcaPredictor,
 }
 
 
@@ -426,10 +438,15 @@ def parse_args() -> Namespace:
 
 
 def main():
+    logging.basicConfig(
+        level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s"
+    )
+    logger = logging.getLogger(__name__)
     args = parse_args()
     with open(args.config, "r") as f:
         yaml_config = yaml.safe_load(f)
     config = Config(**yaml_config)
+    logger.info(f"Loaded config: {config}")
     memory = Memory("cache")
     print(config)
 
@@ -438,6 +455,7 @@ def main():
         for loader_config in config.datasets
         if loader_config is not None
     ]
+    logger.info(f"Loaded loader_fns: {loader_fns}")
 
     predictors: list[PredictorWrapper] = [
         PredictorWrapper(
@@ -450,6 +468,7 @@ def main():
         for predictor_config in config.predictors
         if predictor_config is not None
     ]
+    logger.info(f"Loaded predictors: {predictors}")
 
     with mlflow.start_run():  # type: ignore
         mlflow.log_params(config.__dict__)  # type: ignore
@@ -478,9 +497,6 @@ def main():
                         config.n_cells,
                         rng,
                     )
-                    dataset = Dataset(
-                        name=loader_fn.name,
-                    )
 
                     shared_celltypes: list[str] = np.intersect1d(
                         ar1=query.obs[query_ct_key]
@@ -492,8 +508,14 @@ def main():
                         .loc[lambda x: x >= config.min_n_cells_celltype]
                         .index,  # type: ignore
                     ).tolist()
+
                     shared_features = np.intersect1d(
                         query.var_names, reference.var_names
+                    ).tolist()
+                    dataset = Dataset(
+                        name=loader_fn.name,
+                        shared_celltypes=shared_celltypes,
+                        shared_features=shared_features,
                     )
                     query = query[
                         query.obs[query_ct_key].isin(shared_celltypes),  # type: ignore
@@ -523,10 +545,14 @@ def main():
                             zip(train_idxs, test_idxs)
                         )
                     ]
-                    globally_fitted_models = {
-                        predictor.name: predictor.fit(reference.X)  # type: ignore
-                        for predictor in predictors
-                    }
+                    globally_fitted_models: dict[str, PredictorWrapper] = {}
+                    for predictor in predictors:
+                        logger.info(
+                            f"Fitting globally fitted model for {predictor.name}, on reference data of shape {reference.X.shape}"
+                        )
+                        globally_fitted_models[predictor.name] = predictor.fit(
+                            reference.X  # type: ignore
+                        )
 
                     for celltype_name in shared_celltypes:
                         query_ct_mask = query.obs[query_ct_key] == celltype_name
@@ -538,10 +564,14 @@ def main():
                         _adata_dense_mut(reference_ct)
                         reference_counts_matrix: NumericArray = reference_ct.X.copy()  # type: ignore
 
-                        celltype_fitted_models = {
-                            predictor.name: predictor.fit(reference_counts_matrix)
-                            for predictor in predictors
-                        }
+                        celltype_fitted_models = {}
+                        for predictor in predictors:
+                            logger.info(
+                                f"Fitting celltype fitted model for {predictor.name}, on reference data of shape {reference_counts_matrix.shape}"
+                            )
+                            celltype_fitted_models[predictor.name] = predictor.fit(
+                                reference_counts_matrix
+                            )
                         query_ct = query[query_ct_mask].copy()
                         _adata_dense_mut(query_ct)
                         query_counts_matrix: NumericArray = query_ct.X.copy()  # type: ignore
@@ -593,6 +623,18 @@ def main():
                             globally_fitted_model = globally_fitted_models[model_name]
                             celltype_fitted_model = celltype_fitted_models[model_name]
                             for sample in sample_objects:
+                                global_model_feature_embedding = (
+                                    globally_fitted_model.feature_embedding
+                                    if globally_fitted_model.feature_embedding
+                                    is not None
+                                    else np.nan
+                                )
+                                celltype_model_feature_embedding = (
+                                    celltype_fitted_model.feature_embedding
+                                    if celltype_fitted_model.feature_embedding
+                                    is not None
+                                    else np.nan
+                                )
                                 (
                                     global_model_embedding_reference,
                                     global_model_counts_reference,
@@ -623,6 +665,8 @@ def main():
                                 )
 
                                 result = Result(
+                                    global_model_feature_embedding=global_model_feature_embedding,
+                                    celltype_model_feature_embedding=celltype_model_feature_embedding,
                                     global_model_embedding_reference=global_model_embedding_reference,
                                     global_model_counts_reference=global_model_counts_reference,
                                     celltype_model_embedding_reference=celltype_model_embedding_reference,
@@ -636,8 +680,13 @@ def main():
                                     celltype=celltype,
                                 )
                                 session.add(result)
+                                logger.info(
+                                    f"Added result for sample {sample.id_of_sample}, dataset {dataset.name}, celltype {celltype.name} and model {model_name}"
+                                )
+                logger.info("Committing results")
                 session.commit()
                 mlflow.log_artifact(sqlite_folder_path)  # type: ignore
+    logger.info("Done")
 
 
 if __name__ == "__main__":
