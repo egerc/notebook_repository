@@ -1,14 +1,16 @@
 import json
 import logging
 from argparse import ArgumentParser, Namespace
-from collections.abc import Callable
-from typing import Annotated, Any
+from collections.abc import Sequence
+from typing import Annotated, Any, Literal, Protocol
 
 import numpy as np
 import pandas as pd
+import scanpy as sc
 import yaml
 from anndata import read_h5ad
 from anndata.typing import AnnData
+from nico_wrapper.qc import MarkerSets, marker_annotation_qc
 from pydantic import Field, FilePath, NonNegativeInt
 from pydantic.dataclasses import dataclass
 
@@ -83,16 +85,61 @@ def shuffle_array(
     return shuffled_annotation
 
 
-def dummy_score(
-    adata: AnnData,
-    cluster_key: str,
-    marker_dict: dict[str, list[str]],
-) -> float:
-    return 0.0
+class AnnotationScorer(Protocol):
+    def score(
+        self,
+        adata: AnnData,
+        cluster_key: str,
+        marker_sets: MarkerSets,
+    ) -> dict[str, dict[str, float]]: ...
 
 
-SCORE_REGISTRY: dict[str, Callable[[AnnData, str, dict[str, list[str]]], float]] = {
-    "dummy": dummy_score,
+@dataclass(frozen=True, slots=True)
+class MarkerAnnotationQC:
+    layer: str | None = None
+    use_raw: bool = False
+    gene_symbols_key: str | None = None
+    labels: Sequence[str] | None = None
+    logfc_pseudocount: float = 1e-9
+    logfc_threshold: float = 0.25
+    score_ctrl_size: int = 50
+    score_gene_pool: Sequence[str] | None = None
+    score_n_bins: int = 25
+    score_random_state: int | None = 0
+    de_method: Literal["wilcoxon", "t-test", "t-test_overestim_var"] = "wilcoxon"
+    de_alpha: float = 0.05
+    de_logfc_threshold: float = 0.25
+    de_top_n: int = 50
+    include_optional_score_metrics: bool = False
+
+    def score(
+        self, adata: AnnData, cluster_key: str, marker_sets: MarkerSets
+    ) -> dict[str, dict[str, float]]:
+        df = marker_annotation_qc(
+            adata=adata,
+            markers=marker_sets,
+            label_key=cluster_key,
+            layer=self.layer,
+            use_raw=self.use_raw,
+            gene_symbols_key=self.gene_symbols_key,
+            labels=self.labels,
+            logfc_pseudocount=self.logfc_pseudocount,
+            logfc_threshold=self.logfc_threshold,
+            score_ctrl_size=self.score_ctrl_size,
+            score_gene_pool=self.score_gene_pool,
+            score_n_bins=self.score_n_bins,
+            score_random_state=self.score_random_state,
+            de_method=self.de_method,
+            de_alpha=self.de_alpha,
+            de_logfc_threshold=self.de_logfc_threshold,
+            de_top_n=self.de_top_n,
+            include_optional_score_metrics=self.include_optional_score_metrics,
+        )
+        return df.set_index("cell_type").to_dict("index")
+
+
+SCORER_REGISTRY: dict[str, AnnotationScorer] = {
+    "marker_annotation_qc": MarkerAnnotationQC(),
 }
 
 
@@ -109,6 +156,7 @@ def main() -> None:
     for dataset in config.datasets:
         logging.info(f"Dataset: {dataset.name}")
         adata_full = read_h5ad(dataset.h5ad)
+        sc.pp.log1p(adata_full)
         for sample_id in range(config.n_samples):
             adata_sample = adata_full[
                 rng.choice(adata_full.n_obs, config.n_cells_per_sample, replace=True)
@@ -129,27 +177,29 @@ def main() -> None:
                             f"shuffled_{cluster_key}_{shuffle_probability}"
                         )
                         adata_sample.obs[shuffled_annotation_key] = shuffled_annotation
-                        for score_name, score_func in SCORE_REGISTRY.items():
-                            score = score_func(
-                                adata_sample,
-                                shuffled_annotation_key,
-                                marker_genes_dict,
+                        for score_name, scorer in SCORER_REGISTRY.items():
+                            score = scorer.score(
+                                adata=adata_sample,
+                                cluster_key=shuffled_annotation_key,
+                                marker_sets=marker_genes_dict,
                             )
-                            results.append(
-                                {
-                                    "dataset": dataset.name,
-                                    "sample_id": sample_id,
-                                    "cluster_key": cluster_key,
-                                    "marker_json": marker_json,
-                                    "shuffle_probability": shuffle_probability,
-                                    "score_name": score_name,
-                                    "score": score,
-                                }
-                            )
-                            pd.DataFrame(results).to_csv(
-                                "results.csv",
-                                index=False,
-                            )
+                            for cell_type, cell_score in score.items():
+                                results.append(
+                                    {
+                                        "dataset": dataset.name,
+                                        "sample_id": sample_id,
+                                        "cluster_key": cluster_key,
+                                        "marker_json": marker_json,
+                                        "shuffle_probability": shuffle_probability,
+                                        "score_name": score_name,
+                                        "cell_type": cell_type,
+                                        **cell_score,
+                                    }
+                                )
+                                pd.DataFrame(results).to_csv(
+                                    "results.csv",
+                                    index=False,
+                                )
     logging.info("Results saved to results.csv")
 
 
