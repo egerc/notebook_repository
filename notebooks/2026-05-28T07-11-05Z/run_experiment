@@ -1,0 +1,6 @@
+#!/bin/bash
+#SBATCH --job-name=marker_score
+#SBATCH --mem=64G
+#SBATCH --output=%x-%j.out
+
+uv run experiment.py config.yaml

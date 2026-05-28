@@ -2,4 +2,11 @@
 name = "2026-05-28t07-11-05z"
 version = "0.1.0"
 requires-python = ">=3.12"
-dependencies = []
+dependencies = [
+    "anndata>=0.12.6",
+    "ipython>=9.13.0",
+    "numpy>=2.4.6",
+    "pandas>=3.0.3",
+    "pydantic>=2.13.4",
+    "pyyaml>=6.0.3",
+]

@@ -1,0 +1,11 @@
+datasets:
+    - name: Follicular
+      h5ad: /home/gruengroup/christian/Projects/notebook_repository/notebooks/2026-05-28T07-11-05Z/data/sce_follicular.h5ad
+      cluster_key: celltype
+      marker_json: /home/gruengroup/christian/Projects/notebook_repository/notebooks/2026-05-28T07-11-05Z/data/fl_celltype.json
+    - name: HGSC
+      h5ad: /home/gruengroup/christian/Projects/notebook_repository/notebooks/2026-05-28T07-11-05Z/data/sce_hgsc.h5ad
+      cluster_key: celltype
+      marker_json: /home/gruengroup/christian/Projects/notebook_repository/notebooks/2026-05-28T07-11-05Z/data/hgsc_celltype.json
+shuffle_probabilities: [0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0]
+seed: 0
