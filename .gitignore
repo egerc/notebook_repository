@@ -213,3 +213,6 @@ cache
 mlruns
 *.db
 *test*
+*.out
+*.sbatch
+*.csv
