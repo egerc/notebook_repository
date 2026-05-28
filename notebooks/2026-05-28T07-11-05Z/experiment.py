@@ -13,50 +13,55 @@ from pydantic import Field, FilePath, NonNegativeInt
 from pydantic.dataclasses import dataclass
 
 Probability = Annotated[float, Field(ge=0.0, le=1.0)]
+AnnotationTarget = tuple[str, list[FilePath]]
 
 
 @dataclass(frozen=True, slots=True)
 class Dataset:
     name: str
     h5ad: FilePath
-    cluster_key: str
-    marker_json: FilePath
+    targets: list[AnnotationTarget]
 
-    def __post_init__(self) -> None:
-        adata = read_h5ad(
-            filename=self.h5ad,
-            backed="r",
-        )
-        columns: list[str] = adata.obs.columns.tolist()
-        if self.cluster_key not in columns:
+
+def __post_init__(self) -> None:
+    adata = read_h5ad(filename=self.h5ad, backed="r")
+    columns: list[str] = adata.obs.columns.tolist()
+    for cluster_key, marker_paths in self.targets:
+        if cluster_key not in columns:
             raise ValueError(
-                f"cluster_key {self.cluster_key} not found in columns {columns}"
+                f"[{self.name}] cluster_key '{cluster_key}' not found in columns: {columns}"
             )
-        clusters = adata.obs[self.cluster_key].unique().tolist()
-        with open(self.marker_json) as f:
-            marker_data: dict[str, str] = json.load(f)
-        marker_clusters = list(marker_data.keys())
-        intersection_clusters = set(clusters) & set(marker_clusters)
-        if not intersection_clusters:
-            high_cardinality_columns = {
-                column: len(
-                    set(marker_clusters) & set(adata.obs[column].unique().tolist())
+
+        obs_clusters = set(adata.obs[cluster_key].unique().tolist())
+        for marker_json in marker_paths:
+            with open(marker_json) as f:
+                marker_data: dict[str, str] = json.load(f)
+
+            marker_clusters = set(marker_data.keys())
+            intersection = obs_clusters & marker_clusters
+            if not intersection:
+                high_cardinality_columns = {
+                    col: len(marker_clusters & set(adata.obs[col].unique()))
+                    for col in columns
+                    if len(marker_clusters & set(adata.obs[col].unique())) > 0
+                }
+
+                raise ValueError(
+                    f"Target '{cluster_key}' has no overlap with markers in '{marker_json}'.\n"
+                    f"Suggestions based on other columns: {high_cardinality_columns}"
                 )
-                for column in columns
-                if len(set(marker_clusters) & set(adata.obs[column].unique().tolist()))
-                > 0
-            }
-            raise ValueError(
-                f"No intersection between clusters and marker clusters, columns with high cardinality: {high_cardinality_columns}"
+
+            print(
+                f"Verified: '{cluster_key}' vs '{marker_json}' ({len(intersection)} matches)."
             )
-        else:
-            print(f"Intersection clusters: {intersection_clusters}")
 
 
 @dataclass(frozen=True, slots=True)
 class Config:
     datasets: list[Dataset]
     shuffle_probabilities: list[Probability]
+    n_samples: NonNegativeInt
+    n_cells_per_sample: NonNegativeInt
     seed: NonNegativeInt
 
 
@@ -103,35 +108,48 @@ def main() -> None:
     results: list[dict[str, Any]] = []
     for dataset in config.datasets:
         logging.info(f"Dataset: {dataset.name}")
-        adata = read_h5ad(dataset.h5ad)
-        annotation = np.array(adata.obs[dataset.cluster_key].values)
-        with open(dataset.marker_json) as f:
-            marker_genes_dict: dict[str, list[str]] = json.load(f)
-        for shuffle_probability in config.shuffle_probabilities:
-            shuffled_annotation = shuffle_array(annotation, shuffle_probability, rng)  # type: ignore
-            shuffled_annotation_key = (
-                f"shuffled_{dataset.cluster_key}_{shuffle_probability}"
-            )
-            adata.obs[shuffled_annotation_key] = shuffled_annotation
-            for score_name, score_func in SCORE_REGISTRY.items():
-                score = score_func(
-                    adata,
-                    shuffled_annotation_key,
-                    marker_genes_dict,
-                )
-                results.append(
-                    {
-                        "dataset": dataset.name,
-                        "cluster_key": dataset.cluster_key,
-                        "shuffle_probability": shuffle_probability,
-                        "score_name": score_name,
-                        "score": score,
-                    }
-                )
-                pd.DataFrame(results).to_csv(
-                    "results.csv",
-                    index=False,
-                )
+        adata_full = read_h5ad(dataset.h5ad)
+        for sample_id in range(config.n_samples):
+            adata_sample = adata_full[
+                rng.choice(adata_full.n_obs, config.n_cells_per_sample, replace=True)
+            ]
+            for target in dataset.targets:
+                cluster_key, marker_json_files = target
+                annotation = np.array(adata_sample.obs[cluster_key].values)
+                for marker_json in marker_json_files:
+                    with open(marker_json) as f:
+                        marker_genes_dict: dict[str, list[str]] = json.load(f)
+                    for shuffle_probability in config.shuffle_probabilities:
+                        shuffled_annotation = shuffle_array(
+                            annotation,
+                            shuffle_probability,
+                            rng,
+                        )
+                        shuffled_annotation_key = (
+                            f"shuffled_{cluster_key}_{shuffle_probability}"
+                        )
+                        adata_sample.obs[shuffled_annotation_key] = shuffled_annotation
+                        for score_name, score_func in SCORE_REGISTRY.items():
+                            score = score_func(
+                                adata_sample,
+                                shuffled_annotation_key,
+                                marker_genes_dict,
+                            )
+                            results.append(
+                                {
+                                    "dataset": dataset.name,
+                                    "sample_id": sample_id,
+                                    "cluster_key": cluster_key,
+                                    "marker_json": marker_json,
+                                    "shuffle_probability": shuffle_probability,
+                                    "score_name": score_name,
+                                    "score": score,
+                                }
+                            )
+                            pd.DataFrame(results).to_csv(
+                                "results.csv",
+                                index=False,
+                            )
     logging.info("Results saved to results.csv")
 
 
