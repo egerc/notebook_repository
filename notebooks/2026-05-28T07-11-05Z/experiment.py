@@ -78,10 +78,18 @@ def shuffle_array(
     shuffle_probability: float,
     rng: np.random.Generator,
 ) -> np.ndarray:
-    if shuffle_probability == 0.0:
+    if shuffle_probability <= 0.0:
         return annotation
+    if shuffle_probability >= 1.0:
+        shuffled = annotation.copy()
+        rng.shuffle(shuffled)
+        return shuffled
     shuffled_annotation = annotation.copy()
-    rng.shuffle(shuffled_annotation)
+    n_obs = len(shuffled_annotation)
+    n_to_shuffle = int(n_obs * shuffle_probability)
+    indices_to_modify = rng.choice(n_obs, size=n_to_shuffle, replace=False)
+    new_labels = rng.choice(annotation, size=n_to_shuffle, replace=True)
+    shuffled_annotation[indices_to_modify] = new_labels
     return shuffled_annotation
 
 
