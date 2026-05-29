@@ -1,0 +1,53 @@
+n_samples: 1
+sample_length: 20
+min_n_cells_celltype: 15
+max_n_pcs: 25
+max_n_neighbours: 15
+n_cells: 10000
+predictors:
+    - name: NMF (3 Komponenten, Log Transform, Pre-Init)
+      model_architecture: nmf
+      log_transform: true
+      kwargs:
+          embedding_size: 3
+          pre_init: true
+    - name: PCA (3 Komponenten, Log Transform)
+      model_architecture: pca
+      log_transform: true
+      kwargs:
+          embedding_size: 3
+    - name: NMF (3 Komponenten, Raw Counts)
+      model_architecture: nmf
+      log_transform: false
+      kwargs:
+          embedding_size: 3
+          pre_init: false
+    - name: NMF (3 Komponenten, Log Transform)
+      model_architecture: nmf
+      log_transform: true
+      kwargs:
+          embedding_size: 3
+    - name: SCVI (3 Komponenten, Raw Counts)
+      model_architecture: scvi
+      log_transform: false
+      kwargs:
+          n_factors: 3
+datasets:
+    - type: spatial
+      name: Mouse Intestine Spatial
+      query_path: ../data/mouse_small_intestine_merfish/mouse_small_intestine_merfish.h5ad
+      query_ct_key: "cluster"
+      reference_path: ../data/mouse_small_intestine_sc/mouse_small_intestine_sc.h5ad
+      reference_ct_key: "cluster"
+    - type: spatial
+      name: Andy Spatial
+      query_path: /home/gruengroup/christian/Data/benchmark_sample_data/andy_spatial_downsampled.h5ad
+      query_ct_key: "nico_ct"
+      reference_path: /home/gruengroup/christian/Data/benchmark_sample_data/andy_reference_downsampled.h5ad
+      reference_ct_key: "simple_annot"
+    - type: spatial
+      name: Jennifer Spatial
+      query_path: /home/gruengroup/christian/Data/benchmark_sample_data/jennifer_spatial_downsampled.h5ad
+      query_ct_key: Tacco_pred_cell_type
+      reference_path: /home/gruengroup/christian/Data/benchmark_sample_data/jennifer_reference_downsampled.h5ad
+      reference_ct_key: cell_type
