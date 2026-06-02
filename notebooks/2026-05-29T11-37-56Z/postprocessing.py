@@ -1,3 +1,4 @@
+import csv
 import itertools
 import logging
 from functools import cache, reduce
@@ -384,20 +385,20 @@ def mean_squared_error_evaluator(
 
     return (
         mse_func(
-            result.global_model_counts_reference,
-            result.celltype.reference_counts_matrix,
+            result.global_model_counts_reference[:, result.sample.test_idx],
+            result.celltype.reference_counts_matrix[:, result.sample.test_idx],
         ),
         mse_func(
-            result.global_model_counts_query,
-            result.celltype.query_counts_matrix,
+            result.global_model_counts_query[:, result.sample.test_idx],
+            result.celltype.query_counts_matrix[:, result.sample.test_idx],
         ),
         mse_func(
-            result.celltype_model_counts_reference,
-            result.celltype.reference_counts_matrix,
+            result.celltype_model_counts_reference[:, result.sample.test_idx],
+            result.celltype.reference_counts_matrix[:, result.sample.test_idx],
         ),
         mse_func(
-            result.celltype_model_counts_query,
-            result.celltype.query_counts_matrix,
+            result.celltype_model_counts_query[:, result.sample.test_idx],
+            result.celltype.query_counts_matrix[:, result.sample.test_idx],
         ),
     )
 
@@ -474,12 +475,30 @@ METRIC_FNS: dict[
 }
 
 
+def log_function[T, C](
+    logger: logging.Logger,
+) -> Callable[[Callable[[C], T]], Callable[[C], T]]:
+    """decorator factory for logging purposes"""
+
+    def decorator(func):
+        def wrapper(*args, **kwargs):
+            logger.info(f"Running {func.__name__}...")
+            result = func(*args, **kwargs)
+            logger.info(f"Finished {func.__name__}.")
+            return result
+
+        return wrapper
+
+    return decorator
+
+
 def main():
     memory = Memory("./cache")
     logging.getLogger("sqlalchemy.engine").setLevel(logging.WARNING)
     logging.getLogger("sqlalchemy.pool").setLevel(logging.WARNING)
     logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
     logger = logging.getLogger(__name__)
+    logging_decorator = log_function(logger)
 
     exp_name = "Default"
     benchmark_experiment = mlflow.get_experiment_by_name(exp_name)
@@ -503,36 +522,54 @@ def main():
     sqlite_url = f"sqlite:///{database_path}"
     engine = create_engine(sqlite_url, echo=False)
     logger.info("Database engine initialized.")
+    output_file = "benchmarking_output.csv"
+    fieldnames = [
+        "dataset_name",
+        "celltype",
+        "sample_id",
+        "model_name",
+        "metric_category",
+        "function_name",
+        "model_scope",
+        "dataset_split",
+        "value",
+        "value_transformed",
+    ]
     with Session(engine) as session:
         results = session.exec(select(Result)).all()
-        rows: list[dict[str, Any]] = []
-        for result in tqdm(results):
-            for metric_category, function_mapping in METRIC_FNS.items():
-                for function_name, (
-                    metric_function,
-                    transformation_function,
-                ) in function_mapping.items():
-                    metrics = memory.cache(metric_function)(result)
-                    for value, (model_scope, dataset_split) in zip(
-                        metrics,  # type: ignore
-                        product(["global", "celltype"], ["reference", "query"]),
-                    ):
-                        rows.append(
-                            {
-                                "dataset_name": result.celltype.dataset.name,
-                                "celltype": result.celltype.name,
-                                "sample_id": result.sample.id_of_sample,
-                                "model_name": result.model.name,
-                                "metric_category": metric_category,
-                                "function_name": function_name,
-                                "model_scope": model_scope,
-                                "dataset_split": dataset_split,
-                                "value": value,
-                                "value_transformed": transformation_function(value),
-                            }
-                        )
-                        results_df = pd.DataFrame(rows)
-                        results_df.to_csv("benchmarking_output.csv")
+        with open(output_file, "w", newline="") as csvfile:
+            writer = csv.DictWriter(
+                f=csvfile,
+                fieldnames=fieldnames,
+            )
+            writer.writeheader()
+            for result in tqdm(results):
+                for metric_category, function_mapping in METRIC_FNS.items():
+                    for function_name, (
+                        metric_function,
+                        transformation_function,
+                    ) in function_mapping.items():
+                        metrics: tuple[float, float, float, float] = memory.cache(  # type: ignore
+                            logging_decorator(metric_function)
+                        )(result)
+                        for value, (model_scope, dataset_split) in zip(
+                            metrics,
+                            product(["global", "celltype"], ["reference", "query"]),
+                        ):
+                            writer.writerow(
+                                {
+                                    "dataset_name": result.celltype.dataset.name,
+                                    "celltype": result.celltype.name,
+                                    "sample_id": result.sample.id_of_sample,
+                                    "model_name": result.model.name,
+                                    "metric_category": metric_category,
+                                    "function_name": function_name,
+                                    "model_scope": model_scope,
+                                    "dataset_split": dataset_split,
+                                    "value": value,
+                                    "value_transformed": transformation_function(value),
+                                }
+                            )
 
 
 if __name__ == "__main__":
