@@ -21,4 +21,5 @@ dependencies = [
     "pyarrow>=23.0.1",
     "pandas>=2.3.3",
     "gseapy>=1.2.1",
+    "pre-commit>=4.6.0",
 ]

@@ -1,52 +1,25 @@
 import itertools
 import logging
+from functools import cache, reduce
+from itertools import product
 from typing import Any, Callable, Sequence
 
+import gseapy
 import mlflow
 import nico2_lib as n2l
 import numpy as np
 import pandas as pd
 import scipy
+from joblib import Memory
+from numpy.typing import NDArray
+from sklearn.metrics import mean_squared_error
+from sklearn.metrics.pairwise import cosine_similarity
 from sqlmodel import Session, create_engine, select
 from tqdm import tqdm
 
 from experiment import NumericArray, Result
 
-logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
-logger = logging.getLogger(__name__)
 
-# %%
-exp_name = "Default"
-benchmark_experiment = mlflow.get_experiment_by_name(exp_name)
-if not benchmark_experiment:
-    raise ValueError(f"Experiment '{exp_name}' not found.")
-runs = mlflow.search_runs(experiment_ids=[benchmark_experiment.experiment_id])
-if runs.empty:
-    raise RuntimeError(f"No runs found in experiment '{exp_name}'.")
-last_run_id = runs.sort_values("start_time", ascending=False)["run_id"].iloc[0]
-logger.info(f"Using run_id: {last_run_id}")
-logger.info("Downloading 'database.db'...")
-database_path = mlflow.artifacts.download_artifacts(
-    run_id=last_run_id, artifact_path="database.db"
-)
-logger.info(f"Local path: {database_path}")
-sqlite_url = f"sqlite:///{database_path}"
-engine = create_engine(sqlite_url, echo=False)
-logger.info("Database engine initialized.")
-
-# %%
-# database_path = "/Users/egerc/Documents/Projects/notebook_repository/notebooks/2026-03-11T09-44-10Z/database.db"
-# database_path = Path().cwd() / "database.db"
-logger.info(f"Local path: {database_path}")
-sqlite_url = f"sqlite:///{database_path}"
-engine = create_engine(sqlite_url, echo=False)
-logger.info("Database engine initialized.")
-
-# %% [markdown]
-# ## Embedding Feature Autocorrelation
-
-
-# %%
 def _create_avg_pairwise_metric_fn(
     metric_fn: Callable[[NumericArray, NumericArray], float],
 ) -> Callable[[NumericArray], float]:
@@ -74,27 +47,24 @@ def create_embedding_evaluator(
     def pairwise_correlation_func(
         result: Result,
     ) -> tuple[float, float, float, float]:
-        results: tuple[float, float, float, float] = tuple(
-            [
-                average_pairwise_correlation_func(embedding)
-                for embedding in [
-                    result.global_model_embedding_reference,
-                    result.global_model_embedding_query,
-                    result.celltype_model_embedding_reference,
-                    result.celltype_model_embedding_query,
-                ]
-            ]
+        return (
+            average_pairwise_correlation_func(
+                result.global_model_embedding_reference,
+            ),
+            average_pairwise_correlation_func(
+                result.global_model_embedding_query,
+            ),
+            average_pairwise_correlation_func(
+                result.celltype_model_embedding_reference,
+            ),
+            average_pairwise_correlation_func(
+                result.celltype_model_embedding_query,
+            ),
         )
-        return results
 
     return pairwise_correlation_func
 
 
-# %% [markdown]
-# ## Embedding Structure
-
-
-# %%
 def create_embedding_structure_evaluator(
     structure_function: Callable[[NumericArray, NumericArray], float],
 ) -> Callable[[Result], tuple[float, float, float, float]]:
@@ -204,11 +174,6 @@ def manual_morans_i(
     return float((n / w_sum) * (numerator / sum_sq_z))
 
 
-# %% [markdown]
-# ## Cell wise sparsity
-
-
-# %%
 def gini(arr: NumericArray) -> float:
     """Compute Gini coefficient of a 1D array."""
     if np.amin(arr) < 0:
@@ -259,11 +224,6 @@ def create_embedding_sparsity_evaluator(
     return embedding_sparsity_evaluator
 
 
-# %% [markdown]
-# ## Coverage sparsity
-
-
-# %%
 def make_max_aggregate_featurewise_metric_func(
     func: Callable[[NumericArray], float],
 ) -> Callable[[NumericArray], float]:
@@ -292,17 +252,6 @@ def create_coverage_sparsity_evaluator(
 
     return coverage_sparsity_evaluator
 
-
-# %% [markdown]
-# ## Post-hoc interpretability
-
-# %%
-# %%
-from functools import cache, reduce
-
-import gseapy
-from numpy.typing import NDArray
-from sklearn.metrics.pairwise import cosine_similarity
 
 GeneProgramsDB = frozenset[tuple[str, frozenset[str]]]
 
@@ -387,9 +336,7 @@ def enrichment_score_evaluator(result: Result) -> tuple[float, float, float, flo
     ]
     genes: list[str] = np.intersect1d(database_gene_names, dataset_gene_names).tolist()
     if not genes:
-        logger.warning(
-            f"No overlapping genes found for result {result.id}. Returning 0.0."
-        )
+        print(f"No overlapping genes found for result {result.id}. Returning 0.0.")
         return (0.0, 0.0, 0.0, 0.0)
     gene_program_counts = get_gene_program_counts(
         gene_programs_db=gene_programs_db, genes=genes
@@ -429,7 +376,32 @@ def enrichment_score_evaluator(result: Result) -> tuple[float, float, float, flo
     )
 
 
-# %%
+def mean_squared_error_evaluator(
+    result: Result,
+) -> tuple[float, float, float, float]:
+    def mse_func(arr1: NumericArray, arr2: NumericArray) -> float:
+        return mean_squared_error(arr1, arr2)
+
+    return (
+        mse_func(
+            result.global_model_counts_reference,
+            result.celltype.reference_counts_matrix,
+        ),
+        mse_func(
+            result.global_model_counts_query,
+            result.celltype.query_counts_matrix,
+        ),
+        mse_func(
+            result.celltype_model_counts_reference,
+            result.celltype.reference_counts_matrix,
+        ),
+        mse_func(
+            result.celltype_model_counts_query,
+            result.celltype.query_counts_matrix,
+        ),
+    )
+
+
 def identity(x: float) -> float:
     return x
 
@@ -454,83 +426,114 @@ METRIC_FNS: dict[
     ],
 ] = {
     "embedding_autocorrelation": {
-        "pearsonr": (create_embedding_evaluator(n2l.mt.pearson_metric), tent),
-        "spearmanr": (
-            create_embedding_evaluator(n2l.mt.spearman_metric),
+        "pearsonr": (
+            create_embedding_evaluator(n2l.mt.pearson_metric),  # type: ignore
             tent,
         ),
+        # "spearmanr": (
+        #    create_embedding_evaluator(n2l.mt.spearman_metric),
+        #    tent,
+        # ),
     },
     "embedding_structure": {
         "multivariate_gearys_c": (
             create_embedding_structure_evaluator(compute_multivariate_geary),
             negative,
         ),
-        "morans_i": (
-            create_embedding_structure_evaluator(blabla(manual_morans_i)),
-            identity,
-        ),
+        # "morans_i": (
+        #    create_embedding_structure_evaluator(blabla(manual_morans_i)),
+        #    identity,
+        # ),
     },
     "embedding_sparsity": {
-        "gini": (create_embedding_sparsity_evaluator(gini), identity),
-        "entropy": (create_embedding_sparsity_evaluator(entropy), negative),
+        "gini": (
+            create_embedding_sparsity_evaluator(gini),
+            identity,
+        ),
+        # "entropy": (create_embedding_sparsity_evaluator(entropy), negative),
     },
     "coverage_sparsity": {
-        "gini": (create_coverage_sparsity_evaluator(gini), negative),
-        "entropy": (create_coverage_sparsity_evaluator(entropy), identity),
+        "gini": (
+            create_coverage_sparsity_evaluator(gini),
+            negative,
+        ),
+        # "entropy": (create_coverage_sparsity_evaluator(entropy), identity),
     },
     "biological_enrichment": {
-        "max_cosine_alignment": (enrichment_score_evaluator, identity)
+        "max_cosine_alignment": (
+            enrichment_score_evaluator,
+            identity,
+        )
+    },
+    "feature_prediction_performance": {
+        "mean_squared_error": (
+            mean_squared_error_evaluator,
+            negative,
+        )
     },
 }
 
-# %%
-with Session(engine) as session:
-    result = session.exec(select(Result)).first()
-    enr_score = enrichment_score_evaluator(result)
+
+def main():
+    memory = Memory("./cache")
+    logging.getLogger("sqlalchemy.engine").setLevel(logging.WARNING)
+    logging.getLogger("sqlalchemy.pool").setLevel(logging.WARNING)
+    logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
+    logger = logging.getLogger(__name__)
+
+    exp_name = "Default"
+    benchmark_experiment = mlflow.get_experiment_by_name(exp_name)
+    if not benchmark_experiment:
+        raise ValueError(f"Experiment '{exp_name}' not found.")
+    runs = mlflow.search_runs(experiment_ids=[benchmark_experiment.experiment_id])
+    if runs.empty:  # type: ignore
+        raise RuntimeError(f"No runs found in experiment '{exp_name}'.")
+    last_run_id = runs.sort_values("start_time", ascending=False)["run_id"].iloc[0]  # type: ignore
+    logger.info(f"Using run_id: {last_run_id}")
+    logger.info("Downloading 'database.db'...")
+    database_path = mlflow.artifacts.download_artifacts(  # type: ignore
+        run_id=last_run_id, artifact_path="database.db"
+    )
+    logger.info(f"Local path: {database_path}")
+    sqlite_url = f"sqlite:///{database_path}"
+    engine = create_engine(sqlite_url, echo=False)
+    logger.info("Database engine initialized.")
+
+    logger.info(f"Local path: {database_path}")
+    sqlite_url = f"sqlite:///{database_path}"
+    engine = create_engine(sqlite_url, echo=False)
+    logger.info("Database engine initialized.")
+    with Session(engine) as session:
+        results = session.exec(select(Result)).all()
+        rows: list[dict[str, Any]] = []
+        for result in tqdm(results):
+            for metric_category, function_mapping in METRIC_FNS.items():
+                for function_name, (
+                    metric_function,
+                    transformation_function,
+                ) in function_mapping.items():
+                    metrics = memory.cache(metric_function)(result)
+                    for value, (model_scope, dataset_split) in zip(
+                        metrics,  # type: ignore
+                        product(["global", "celltype"], ["reference", "query"]),
+                    ):
+                        rows.append(
+                            {
+                                "dataset_name": result.celltype.dataset.name,
+                                "celltype": result.celltype.name,
+                                "sample_id": result.sample.id_of_sample,
+                                "model_name": result.model.name,
+                                "metric_category": metric_category,
+                                "function_name": function_name,
+                                "model_scope": model_scope,
+                                "dataset_split": dataset_split,
+                                "value": value,
+                                "value_transformed": transformation_function(value),
+                            }
+                        )
+                        results_df = pd.DataFrame(rows)
+                        results_df.to_csv("benchmarking_output.csv")
 
 
-# %%
-import logging
-
-# Silence all SQLAlchemy engine logs
-logging.getLogger("sqlalchemy.engine").setLevel(logging.WARNING)
-
-# If you still see some noise, silence the pools too
-logging.getLogger("sqlalchemy.pool").setLevel(logging.WARNING)
-
-# %%
-from itertools import product
-
-from joblib import Memory
-
-memory = Memory("./cache")
-
-with Session(engine) as session:
-    results = session.exec(select(Result)).all()
-    rows: list[dict[str, Any]] = []
-    for result in tqdm(results):
-        for metric_category, function_mapping in METRIC_FNS.items():
-            for function_name, (
-                metric_function,
-                transformation_function,
-            ) in function_mapping.items():
-                metrics = memory.cache(metric_function)(result)
-                for value, (model_scope, dataset_split) in zip(
-                    metrics, product(["global", "celltype"], ["reference", "query"])
-                ):
-                    rows.append(
-                        {
-                            "dataset_name": result.celltype.dataset.name,
-                            "celltype": result.celltype.name,
-                            "sample_id": result.sample.id_of_sample,
-                            "model_name": result.model.name,
-                            "metric_category": metric_category,
-                            "function_name": function_name,
-                            "model_scope": model_scope,
-                            "dataset_split": dataset_split,
-                            "value": value,
-                            "value_transformed": transformation_function(value),
-                        }
-                    )
-    results_df = pd.DataFrame(rows)
-results_df.to_csv("benchmarking_output.csv")
+if __name__ == "__main__":
+    main()

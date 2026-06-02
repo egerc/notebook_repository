@@ -27,11 +27,31 @@ predictors:
       log_transform: true
       kwargs:
           embedding_size: 3
+    - name: NMF (5 Komponenten, Log Transform)
+      model_architecture: nmf
+      log_transform: true
+      kwargs:
+          embedding_size: 5
+    - name: NMF (10 Komponenten, Log Transform)
+      model_architecture: nmf
+      log_transform: true
+      kwargs:
+          embedding_size: 10
     - name: SCVI (3 Komponenten, Raw Counts)
       model_architecture: scvi
       log_transform: false
       kwargs:
           n_factors: 3
+    - name: SCVI (5 Komponenten, Raw Counts)
+      model_architecture: scvi
+      log_transform: false
+      kwargs:
+          n_factors: 5
+    - name: SCVI (10 Komponenten, Raw Counts)
+      model_architecture: scvi
+      log_transform: false
+      kwargs:
+          n_factors: 10
 datasets:
     - type: spatial
       name: Mouse Intestine Spatial

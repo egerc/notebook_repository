@@ -548,7 +548,7 @@ def main():
                     globally_fitted_models: dict[str, PredictorWrapper] = {}
                     for predictor in predictors:
                         logger.info(
-                            f"Fitting globally fitted model for {predictor.name}, on reference data of shape {reference.X.shape}"
+                            f"Fitting globally fitted model for {predictor.name}, on reference data of shape {reference.X.shape}"  # type: ignore
                         )
                         globally_fitted_models[predictor.name] = predictor.fit(
                             reference.X  # type: ignore
@@ -627,13 +627,13 @@ def main():
                                     globally_fitted_model.feature_embedding
                                     if globally_fitted_model.feature_embedding
                                     is not None
-                                    else np.nan
+                                    else np.array([np.nan])
                                 )
                                 celltype_model_feature_embedding = (
                                     celltype_fitted_model.feature_embedding
                                     if celltype_fitted_model.feature_embedding
                                     is not None
-                                    else np.nan
+                                    else np.array([np.nan])
                                 )
                                 (
                                     global_model_embedding_reference,
