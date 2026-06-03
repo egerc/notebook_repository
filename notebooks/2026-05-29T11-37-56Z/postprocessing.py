@@ -3,15 +3,13 @@ import itertools
 import logging
 from functools import cache, reduce
 from itertools import product
-from typing import Any, Callable, Sequence
+from typing import Callable, Sequence
 
 import gseapy
 import mlflow
 import nico2_lib as n2l
 import numpy as np
-import pandas as pd
 import scipy
-from joblib import Memory
 from numpy.typing import NDArray
 from sklearn.metrics import mean_squared_error
 from sklearn.metrics.pairwise import cosine_similarity
@@ -381,7 +379,10 @@ def mean_squared_error_evaluator(
     result: Result,
 ) -> tuple[float, float, float, float]:
     def mse_func(arr1: NumericArray, arr2: NumericArray) -> float:
-        return mean_squared_error(arr1, arr2)
+        if np.any(np.isnan(arr1)) or np.any(np.isnan(arr2)):
+            return np.nan
+            logging.warning("NaN values encountered in MSE calculation")
+        return float(mean_squared_error(arr1, arr2))
 
     return (
         mse_func(
@@ -493,7 +494,6 @@ def log_function[T, C](
 
 
 def main():
-    memory = Memory("./cache")
     logging.getLogger("sqlalchemy.engine").setLevel(logging.WARNING)
     logging.getLogger("sqlalchemy.pool").setLevel(logging.WARNING)
     logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
@@ -544,13 +544,14 @@ def main():
             )
             writer.writeheader()
             for result in tqdm(results):
+                logger.info(f"Processing result {result.id}")
                 for metric_category, function_mapping in METRIC_FNS.items():
                     for function_name, (
                         metric_function,
                         transformation_function,
                     ) in function_mapping.items():
-                        metrics: tuple[float, float, float, float] = memory.cache(  # type: ignore
-                            logging_decorator(metric_function)
+                        metrics: tuple[float, float, float, float] = logging_decorator(
+                            metric_function
                         )(result)
                         for value, (model_scope, dataset_split) in zip(
                             metrics,
@@ -570,6 +571,8 @@ def main():
                                     "value_transformed": transformation_function(value),
                                 }
                             )
+                            csvfile.flush()
+    logger.info("Done")
 
 
 if __name__ == "__main__":

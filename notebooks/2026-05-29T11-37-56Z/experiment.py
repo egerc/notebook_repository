@@ -135,6 +135,10 @@ class PredictorWrapper:
     def feature_embedding(self) -> NumericArray | None:
         return self.predictor.feature_embedding
 
+    @property
+    def embedding_size(self) -> int | None:
+        return self.predictor.embedding_size
+
 
 @dataclass(frozen=True)
 class LoaderFnWrapper:
@@ -340,6 +344,25 @@ def max_cosine_alignment_scoring(
     return float(np.mean(max_similarities))
 
 
+def _nmf_components_config(
+    input: int | Literal["consensus_nmf", "knee"] | None,
+) -> int | Callable[[NumericArray], int] | None:
+    if input is None:
+        return None
+    if input == "consensus_nmf":
+        return lambda x: n2l.pd.consensus_nmf(
+            x,
+            k_range=range(2, 10),
+            n_runs=5,
+            max_iter=500,
+        )
+    if input == "knee":
+        return lambda x: n2l.pd.find_k_by_inflection(
+            x, k_range=range(2, 10), max_iter=500
+        )[0]
+    return input
+
+
 PREDICTOR_REGISTRY: dict[ModelArchitecture, n2l.pd.PredictorProtocol] = {  # type: ignore
     "mock": MockPredictor,
     "nmf": n2l.pd.NmfPredictor,
@@ -468,6 +491,39 @@ def main():
         for predictor_config in config.predictors
         if predictor_config is not None
     ]
+    predictors.append(
+        PredictorWrapper(
+            name="NMF (Knee, Log Transform)",
+            log_transform=True,
+            predictor=PREDICTOR_REGISTRY["nmf"](  # type: ignore
+                **{
+                    "n_components": lambda x: n2l.pd.consensus_nmf(
+                        x,
+                        k_range=range(2, 10),
+                        n_runs=5,
+                        max_iter=500,
+                    )
+                }
+            ),
+        )
+    )
+    predictors.append(
+        PredictorWrapper(
+            name="NMF (Consensus, Log Transform)",
+            log_transform=True,
+            predictor=PREDICTOR_REGISTRY["nmf"](  # type: ignore
+                **{
+                    "n_components": lambda x: n2l.pd.consensus_nmf(
+                        x,
+                        k_range=range(2, 10),
+                        n_runs=5,
+                        max_iter=500,
+                    )
+                }
+            ),
+        )
+    )
+
     logger.info(f"Loaded predictors: {predictors}")
 
     with mlflow.start_run():  # type: ignore
@@ -552,6 +608,9 @@ def main():
                         )
                         globally_fitted_models[predictor.name] = predictor.fit(
                             reference.X  # type: ignore
+                        )
+                        logger.info(
+                            f"Globally fitted model for {predictor.name} has embedding size {globally_fitted_models[predictor.name].embedding_size}"
                         )
 
                     for celltype_name in shared_celltypes:

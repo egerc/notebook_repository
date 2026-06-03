@@ -48,37 +48,36 @@ def _(df, plt, sns):
     custom_palette = ["#1f77b4", "#ff7f0e", "#2ca02c"]
     g = sns.catplot(
         data=df,
-        x="model_name",
-        y="value",
+        y="model_name",
+        x="value",
         hue="model_scope_data_split",
-        row="dataset_name",
-        col="metric",
+        col="dataset_name",
+        row="metric",
         kind="box",
         showfliers=False,
-        sharey=False,
+        sharex=False,
         palette=custom_palette,
         height=4,
         aspect=1.2,
-        legend=False,
+        legend=True,
         margin_titles=True,
     )
 
     g.set_axis_labels("Model Architecture", "Metric Value", fontweight="bold")
-    g.set_titles(row_template="{row_name}", col_template="{col_name}", weight="bold")
-
-    for ax in g.axes.flat:
-        ax.tick_params(axis="x", rotation=45)
-        ax.yaxis.set_major_formatter("{x:.2f}")
-
-    g.add_legend(
-        title="Dataset Split",
-        loc="upper center",
-        bbox_to_anchor=(0.5, 1.05),
-        ncol=3,
-        frameon=True,
+    g.set_titles(
+        row_template="{row_name}", col_template="{col_name}", weight="bold"
     )
 
-    sns.despine(left=True)  # Remove left spine for a modern "open" look
+
+    #g.add_legend(
+    #    title="Dataset Split",
+    #    loc="upper center",
+    #    bbox_to_anchor=(0.5, 1.05),
+    #    ncol=3,
+    #    frameon=True,
+    #)
+
+    sns.despine(left=True)
     plt.tight_layout()
     g.savefig("test.svg")
     g
