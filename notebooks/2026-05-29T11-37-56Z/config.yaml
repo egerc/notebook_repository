@@ -1,10 +1,10 @@
-n_samples: 1
+n_samples: 5
 sample_length: 20
 min_n_cells_celltype: 15
 max_n_pcs: 25
 max_n_neighbours: 15
 #n_cells: 10000
-n_cells: 2000
+n_cells: 5000
 predictors:
     - name: NMF (3 Komponenten, Log Transform)
       model_architecture: nmf

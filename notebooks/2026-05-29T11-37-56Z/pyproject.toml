@@ -22,4 +22,5 @@ dependencies = [
     "pandas>=2.3.3",
     "gseapy>=1.2.1",
     "pre-commit>=4.6.0",
+    "plotly>=6.8.0",
 ]
