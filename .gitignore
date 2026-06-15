@@ -216,3 +216,4 @@ mlruns
 *.out
 *.sbatch
 *.csv
+*.svg
