@@ -12,14 +12,16 @@ mlflow_config:
     description: ~
     log_system_metrics: ~
 sampling_config:
-    n_samples: 2
-    sample_length: 2
+    n_samples: 5
+    sample_length: 20
 predictors:
     - name: PCA
+      scope: "celltype"
       model:
           type: nmf
           n_components: 2
     - name: PCA
+      scope: "celltype"
       model:
           type: pca
           n_components: 2
@@ -29,7 +31,7 @@ datasets:
       query_cluster_key: "C_scanvi"
       reference_path: "/home/gruengroup/christian/Projects/notebook_repository/notebooks/data/mouse_small_intestine_sc/mouse_small_intestine_sc.h5ad"
       reference_cluster_key: "cluster"
-      min_n_cells_celltype: 2
-      n_cells: 2
-      max_n_pcs: 2
-      max_n_neighbours: 2
+      min_n_cells_celltype: 20
+      n_cells: 500
+      max_n_pcs: 10
+      max_n_neighbours: 6

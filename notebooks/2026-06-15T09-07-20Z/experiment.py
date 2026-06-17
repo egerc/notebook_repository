@@ -1,9 +1,10 @@
-from __future__ import annotations
-
 import logging
+import os
 from argparse import ArgumentParser, Namespace
 from collections.abc import Generator, Sequence
-from functools import partial
+from enum import Enum
+from functools import partial, reduce
+from itertools import product
 from tempfile import TemporaryDirectory
 from typing import Annotated, Any, Callable, Literal
 
@@ -21,18 +22,10 @@ from pydantic.dataclasses import dataclass
 from pydantic.functional_validators import model_validator
 from pydantic.types import FilePath, NonNegativeInt, PositiveInt
 from pydantic_core import PydanticCustomError
-
-
-@dataclass(frozen=True, config=pydantic.ConfigDict(extra="forbid"))
-class ExperimentConfig:
-    """Configuration for the experiment."""
-
-    predictors: Annotated[list[PredictorConfig], pydantic.Field(min_length=1)]
-    datasets: Annotated[list[DatasetConfig], pydantic.Field(min_length=1)]
-    seed: NonNegativeInt | None
-    sampling_config: SamplingConfig | None
-    mlflow_config: MlFlowConfig | None
-    log_level: int = 20
+from scipy.sparse import issparse
+from sklearn.decomposition import PCA
+from sklearn.neighbors import kneighbors_graph
+from umap import UMAP
 
 
 @dataclass(frozen=True, slots=True)
@@ -103,7 +96,7 @@ class PcaConfig:
 @dataclass(frozen=True, slots=True)
 class PredictorConfig:
     name: str
-    scope: Literal["global", "celltype", "both"]
+    scope: Literal["global", "celltype"]
     model: Annotated[
         NmfConfig | PcaConfig,
         pydantic.Field(discriminator="type"),
@@ -141,7 +134,7 @@ class DatasetConfig:
     max_n_neighbours: PositiveInt
 
     @model_validator(mode="after")
-    def check_cluster_keys(self) -> DatasetConfig:
+    def check_cluster_keys(self) -> "DatasetConfig":
         for dataset_split, dataset_path, cluster_key in [
             ("query", self.query_path, self.query_cluster_key),
             ("reference", self.reference_path, self.reference_cluster_key),
@@ -170,6 +163,18 @@ class DatasetConfig:
         return read_h5ad(self.reference_path)
 
 
+@dataclass(frozen=True, config=pydantic.ConfigDict(extra="forbid"))
+class ExperimentConfig:
+    """Configuration for the experiment."""
+
+    predictors: Annotated[list[PredictorConfig], pydantic.Field(min_length=1)]
+    datasets: Annotated[list[DatasetConfig], pydantic.Field(min_length=1)]
+    seed: NonNegativeInt | None
+    sampling_config: SamplingConfig | None
+    mlflow_config: MlFlowConfig | None
+    log_level: int = 20
+
+
 class PklType(sqlmodel.TypeDecorator):
     impl = sqlmodel.LargeBinary
     cache_ok = True
@@ -185,29 +190,27 @@ class PklType(sqlmodel.TypeDecorator):
         return pickle.loads(value)  # type: ignore
 
 
-class Dataset(sqlmodel.SQLModel, table=True):
-    id: int | None = sqlmodel.Field(default=None, primary_key=True)
-
-    name: str
-    shared_cell_types: list[str] = sqlmodel.Field(sa_column=sqlmodel.Column(PklType))
-    shared_features: list[str] = sqlmodel.Field(sa_column=sqlmodel.Column(PklType))
-
-    celltypes: list[Celltype] = sqlmodel.Relationship(back_populates="dataset")
-    samples: list[Sample] = sqlmodel.Relationship(back_populates="dataset")
+class ModelScope(str, Enum):
+    GLOBAL = "global"
+    CELLTYPE = "celltype"
 
 
 class Sample(sqlmodel.SQLModel, table=True):
+    model_config = {"arbitrary_types_allowed": True}
     id: int | None = sqlmodel.Field(default=None, primary_key=True)
 
     id_of_sample: int
     train_idx: IndexArray = sqlmodel.Field(sa_column=sqlmodel.Column(PklType))
     test_idx: IndexArray = sqlmodel.Field(sa_column=sqlmodel.Column(PklType))
 
+    results: list["Result"] = sqlmodel.Relationship(back_populates="sample")
+
     dataset_id: int | None = sqlmodel.Field(default=None, foreign_key="dataset.id")
-    dataset: Dataset = sqlmodel.Relationship(back_populates="samples")
+    dataset: "Dataset" = sqlmodel.Relationship(back_populates="samples")
 
 
 class Celltype(sqlmodel.SQLModel, table=True):
+    model_config = {"arbitrary_types_allowed": True}
     id: int | None = sqlmodel.Field(default=None, primary_key=True)
 
     name: str
@@ -236,19 +239,73 @@ class Celltype(sqlmodel.SQLModel, table=True):
         sa_column=sqlmodel.Column(PklType)
     )
 
+    results: list["Result"] = sqlmodel.Relationship(back_populates="celltype")
+
     dataset_id: int | None = sqlmodel.Field(default=None, foreign_key="dataset.id")
-    dataset: Dataset = sqlmodel.Relationship(back_populates="celltypes")
+    dataset: "Dataset" = sqlmodel.Relationship(back_populates="celltypes")
+
+
+class Dataset(sqlmodel.SQLModel, table=True):
+    id: int | None = sqlmodel.Field(default=None, primary_key=True)
+
+    name: str
+    shared_cell_types: list[str] = sqlmodel.Field(sa_column=sqlmodel.Column(PklType))
+    shared_features: list[str] = sqlmodel.Field(sa_column=sqlmodel.Column(PklType))
+
+    celltypes: list["Celltype"] = sqlmodel.Relationship(back_populates="dataset")
+    samples: list["Sample"] = sqlmodel.Relationship(back_populates="dataset")
 
 
 class Model(sqlmodel.SQLModel, table=True):
     id: int | None = sqlmodel.Field(default=None, primary_key=True)
 
     name: str
-    scope: Literal["global", "celltype", "both"]
+    scope: ModelScope
+
+    results: list["Result"] = sqlmodel.Relationship(back_populates="model")
 
 
 class Result(sqlmodel.SQLModel, table=True):
+    model_config = {"arbitrary_types_allowed": True}
     id: int | None = sqlmodel.Field(default=None, primary_key=True)
+
+    model_feature_embedding: NumericArray = sqlmodel.Field(
+        sa_column=sqlmodel.Column(PklType)
+    )
+    model_embedding_reference: NumericArray = sqlmodel.Field(
+        sa_column=sqlmodel.Column(PklType)
+    )
+    model_counts_reference: NumericArray = sqlmodel.Field(
+        sa_column=sqlmodel.Column(PklType)
+    )
+    model_embedding_query: NumericArray = sqlmodel.Field(
+        sa_column=sqlmodel.Column(PklType)
+    )
+    model_counts_query: NumericArray = sqlmodel.Field(
+        sa_column=sqlmodel.Column(PklType)
+    )
+
+    celltype_id: int | None = sqlmodel.Field(
+        default=None, foreign_key="celltype.id", nullable=False
+    )
+    celltype: Celltype = sqlmodel.Relationship(back_populates="results")
+    model_id: int | None = sqlmodel.Field(
+        default=None, foreign_key="model.id", nullable=False
+    )
+    model: Model = sqlmodel.Relationship(back_populates="results")
+    sample_id: int | None = sqlmodel.Field(
+        default=None, foreign_key="sample.id", nullable=False
+    )
+    sample: Sample = sqlmodel.Relationship(back_populates="results")
+
+
+def _adata_dense_mut(adata: AnnData) -> AnnData:
+    if issparse(adata.X):
+        # .toarray() works on both matrices and views
+        adata.X = adata.X.toarray()  # type: ignore
+        return adata
+    else:
+        return adata
 
 
 def generate_datasets(
@@ -262,6 +319,7 @@ def generate_datasets(
             dataset_config.load_reference(),
             dataset_config.load_query(),
         )
+        reference, query = _adata_dense_mut(reference), _adata_dense_mut(query)
         shared_celltypes: list[str] = list(
             set(reference.obs[dataset_config.reference_cluster_key]).intersection(
                 set(query.obs[dataset_config.query_cluster_key])
@@ -309,20 +367,76 @@ def generate_celltypes(
     dataset_config: DatasetConfig,
 ) -> Generator[Celltype, None, None]:
     for celltype_name in dataset.shared_cell_types:
+        reference_counts_matrix = reference[
+            reference.obs[dataset_config.reference_cluster_key] == celltype_name
+        ].X
+        query_counts_matrix = query[
+            query.obs[dataset_config.query_cluster_key] == celltype_name
+        ].X
+        if (
+            reference_counts_matrix.shape[0] < dataset_config.min_n_cells_celltype  # type: ignore
+            or query_counts_matrix.shape[0] < dataset_config.min_n_cells_celltype  # type: ignore
+        ):
+            continue
+
+        n_obs_query = query_counts_matrix.shape[0]  # type: ignore
+        n_obs_ref = reference_counts_matrix.shape[0]  # type: ignore
+        n_vars = query_counts_matrix.shape[1]  # type: ignore
+        n_pcs: int = reduce(
+            min, [dataset_config.max_n_pcs, n_obs_query, n_obs_ref, n_vars]
+        )
+        reference_pca_embedding = np.array(
+            PCA(n_components=n_pcs).fit_transform(reference_counts_matrix)
+        )
+        query_pca_embedding = np.array(
+            PCA(n_components=n_pcs).fit_transform(query_counts_matrix)
+        )
+        reference_umap_embedding = UMAP(n_components=2).fit_transform(
+            reference_pca_embedding
+        )
+        query_umap_embedding = UMAP(n_components=2).fit_transform(query_pca_embedding)
+        n_neighbours = reduce(
+            min, [dataset_config.max_n_neighbours, dataset_config.max_n_pcs - 1]
+        )
+        reference_adjacency_matrix: NumericArray = kneighbors_graph(
+            reference_pca_embedding,
+            n_neighbors=n_neighbours,  # type: ignore
+        )  # type: ignore
+        query_adjacency_matrix: NumericArray = kneighbors_graph(
+            query_pca_embedding,
+            n_neighbors=n_neighbours,  # type: ignore
+        )  # type: ignore
+
         yield Celltype(
             name=celltype_name,
-            reference_counts_matrix=reference[
-                reference.obs[dataset_config.reference_cluster_key] == celltype_name
-            ].X,
-            query_counts_matrix=query[
-                query.obs[dataset_config.query_cluster_key] == celltype_name
-            ].X,
+            reference_counts_matrix=reference_counts_matrix,  # type: ignore
+            query_counts_matrix=query_counts_matrix,  # type: ignore
+            reference_pca_embedding=reference_pca_embedding,
+            query_pca_embedding=query_pca_embedding,
+            reference_umap_embedding=reference_umap_embedding,  # type: ignore
+            query_umap_embedding=query_umap_embedding,  # type: ignore
+            reference_adjacency_matrix=reference_adjacency_matrix,
+            query_adjacency_matrix=query_adjacency_matrix,
         )
 
 
 def generate_models(
     predictor_configs: Sequence[PredictorConfig],
-) -> Generator[Model, None, None]: ...
+) -> Generator[tuple[Model, PredictorConfig], None, None]:
+    for predictor_config in predictor_configs:
+        match predictor_config.scope:
+            case "global":
+                scope = ModelScope.GLOBAL
+            case _:
+                scope = ModelScope.CELLTYPE
+
+        yield (
+            Model(
+                name=predictor_config.name,
+                scope=scope,
+            ),
+            predictor_config,
+        )
 
 
 def parse_args() -> Namespace:
@@ -331,7 +445,7 @@ def parse_args() -> Namespace:
     return parser.parse_args()
 
 
-def main():
+def main() -> None:
     args = parse_args()
     with open(args.config, "r") as f:
         experiment_config = ExperimentConfig(**yaml.safe_load(f))
@@ -365,35 +479,98 @@ def main():
         log_system_metrics=mlflow_config.log_system_metrics,
     ):
         mlflow.log_params(experiment_config.__dict__)
-        with TemporaryDirectory() as _:
-            for (
-                dataset,
-                (reference, query),
-                dataset_config,
-            ) in generate_datasets(
-                experiment_config.datasets,
-            ):
-                for sample in generate_samples(
-                    sampling_config=(
-                        experiment_config.sampling_config
-                        or SamplingConfig(
-                            n_samples=5,
-                            sample_length=20,
-                        )
-                    ),
-                    rng=rng,
-                    dataset=dataset,
+        with TemporaryDirectory() as tmpdir:
+            sqlite_file_name = "database.db"
+            sqlite_folder_path = os.path.join(tmpdir, sqlite_file_name)
+            sqlite_url = f"sqlite:///{sqlite_folder_path}"
+            engine = sqlmodel.create_engine(sqlite_url, echo=True)
+            sqlmodel.SQLModel.metadata.create_all(engine)
+            with sqlmodel.Session(engine) as session:
+                models = list(
+                    generate_models(predictor_configs=experiment_config.predictors)
+                )
+                for (
+                    dataset,
+                    (query, reference),
+                    dataset_config,
+                ) in generate_datasets(
+                    experiment_config.datasets,
                 ):
-                    for celltype in generate_celltypes(
-                        dataset=dataset,
-                        reference=reference,
-                        query=query,
-                        dataset_config=dataset_config,
-                    ):
-                        for model in generate_models(
-                            predictor_configs=experiment_config.predictors,
+                    samples = list(
+                        generate_samples(
+                            sampling_config=(
+                                experiment_config.sampling_config
+                                or SamplingConfig(n_samples=5, sample_length=20)
+                            ),
+                            rng=rng,
+                            dataset=dataset,
+                        )
+                    )
+                    celltypes = list(
+                        generate_celltypes(
+                            dataset=dataset,
+                            reference=reference,
+                            query=query,
+                            dataset_config=dataset_config,
+                        )
+                    )
+                    for model, predictor_config in models:
+                        logger.info(
+                            f"Fitting model {model.name} on dataset {dataset.name}"
+                        )
+                        predictor = predictor_config.model.instantiate_model()
+                        match predictor_config.scope:
+                            case "global":
+                                predictor = predictor.fit(reference.X)  # type: ignore
+                                my_generator = (
+                                    (celltype, predictor) for celltype in celltypes
+                                )
+                            case "celltype":
+                                my_generator = (
+                                    (
+                                        celltype,
+                                        predictor.fit(celltype.reference_counts_matrix),
+                                    )
+                                    for celltype in celltypes
+                                )
+                        for (celltype, predictor_protocol), sample in product(
+                            my_generator, samples
                         ):
-
+                            model_embedding_query, model_counts_query = (
+                                predictor_protocol.predict(
+                                    x=celltype.query_counts_matrix[:, sample.train_idx],
+                                    indexer=sample.train_idx,
+                                )
+                            )
+                            model_embedding_reference, model_counts_reference = (
+                                predictor_protocol.predict(
+                                    x=celltype.reference_counts_matrix[
+                                        :, sample.train_idx
+                                    ],
+                                    indexer=sample.train_idx,
+                                )
+                            )
+                            model_feature_embedding = (
+                                predictor_protocol.feature_embedding
+                                if predictor_protocol.feature_embedding is not None
+                                else np.array(np.nan)
+                            )
+                            result = Result(
+                                model_embedding_reference=model_embedding_reference,
+                                model_counts_reference=model_counts_reference,
+                                model_embedding_query=model_embedding_query,
+                                model_counts_query=model_counts_query,
+                                model_feature_embedding=model_feature_embedding,
+                                model=model,
+                            )
+                            session.add(result)
+                            logger.info(
+                                f"Added result for sample {sample.id_of_sample}, dataset {dataset.name}, celltype {celltype.name} and model {model.name}"
+                            )
+                logger.info("Committing results")
+                session.commit()
+                mlflow.log_artifact(sqlite_folder_path)
+    logger.info("Done")
 
 
 if __name__ == "__main__":
