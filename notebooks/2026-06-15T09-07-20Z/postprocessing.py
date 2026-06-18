@@ -1,7 +1,7 @@
+import itertools
 import logging
 from collections.abc import Callable, Sequence
 from functools import cache, reduce
-import itertools
 
 import gseapy
 import mlflow
@@ -14,6 +14,7 @@ from numpy.typing import NDArray
 from pandas.io.parsers.python_parser import csv
 from sklearn.metrics import mean_squared_error
 from sklearn.metrics.pairwise import cosine_similarity
+from sklearn.preprocessing import StandardScaler
 from sqlmodel import Session, create_engine, select
 from tqdm import tqdm
 
@@ -219,6 +220,7 @@ def make_max_aggregate_featurewise_metric_func(
 ) -> Callable[[NumericArray], float]:
 
     def aggregate_cellwise_metric_func(arr: NumericArray) -> float:
+        arr = StandardScaler().fit_transform(arr)
         return float(func(np.max(arr, axis=1)))
 
     return aggregate_cellwise_metric_func
@@ -405,7 +407,7 @@ METRIC_FNS: dict[
             identity,
         ),
     },
-    "coverage_sparsity": {
+    "coverage": {
         "gini": (
             create_coverage_sparsity_evaluator(gini),
             negative,

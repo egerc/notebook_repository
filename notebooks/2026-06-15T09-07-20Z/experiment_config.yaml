@@ -12,25 +12,119 @@ mlflow_config:
     description: ~
     log_system_metrics: ~
 sampling_config:
-    n_samples: 5
+    n_samples: 1
     sample_length: 20
 predictors:
-    - name: PCA
-      scope: "celltype"
+    - name: NMF (3 components)
+      scope: celltype
+      transform: ~
       model:
           type: nmf
-          n_components: 2
-    - name: PCA
-      scope: "celltype"
+          n_components: 3
+    - name: NMF (3 components)
+      scope: global
+      transform: ~
+      model:
+          type: nmf
+          n_components: 3
+    - name: NMF (5 components)
+      scope: celltype
+      transform: ~
+      model:
+          type: nmf
+          n_components: 5
+    - name: NMF (5 components)
+      scope: global
+      transform: ~
+      model:
+          type: nmf
+          n_components: 5
+    - name: NMF (10 components)
+      scope: celltype
+      transform: ~
+      model:
+          type: nmf
+          n_components: 10
+    - name: NMF (10 components)
+      scope: global
+      transform: ~
+      model:
+          type: nmf
+          n_components: 10
+    - name: NMF (Knee)
+      scope: celltype
+      transform: ~
+      model:
+          type: nmf
+          n_components: knee
+    - name: NMF (Knee)
+      scope: global
+      transform: ~
+      model:
+          type: nmf
+          n_components: knee
+    - name: NMF (Consensus)
+      scope: celltype
+      transform: ~
+      model:
+          type: nmf
+          n_components: consensus
+    - name: NMF (Consensus)
+      scope: global
+      transform: ~
+      model:
+          type: nmf
+          n_components: consensus
+    - name: NMF (3 components)
+      scope: celltype
+      transform: log
+      model:
+          type: nmf
+          n_components: 3
+    - name: NMF (3 components)
+      scope: global
+      transform: log
+      model:
+          type: nmf
+          n_components: 3
+    - name: PCA (3 components)
+      scope: celltype
+      transform: ~
       model:
           type: pca
-          n_components: 2
-    - name: scVI
-      scope: "global"
+          n_components: 3
+    - name: PCA (3 components)
+      scope: global
+      transform: ~
+      model:
+          type: pca
+          n_components: 3
+    - name: PCA (3 components)
+      scope: celltype
+      transform: log
+      model:
+          type: pca
+          n_components: 3
+    - name: PCA (3 components)
+      scope: global
+      transform: log
+      model:
+          type: pca
+          n_components: 3
+    - name: scVI (3 Components)
+      scope: global
+      transform: ~
       model:
           type: scvi
-          n_components: 2
-          max_epochs: 5
+          n_components: 3
+          max_epochs: 200
+    - name: scVI (3 Components)
+      scope: celltype
+      transform: ~
+      model:
+          type: scvi
+          n_components: 3
+          max_epochs: 200
 datasets:
     - name: "Mouse Intestine"
       query_path: "/home/gruengroup/christian/Data/mouse_intestine/intestine_MERFISH.h5ad"
@@ -38,6 +132,25 @@ datasets:
       reference_path: "/home/gruengroup/christian/Projects/notebook_repository/notebooks/data/mouse_small_intestine_sc/mouse_small_intestine_sc.h5ad"
       reference_cluster_key: "cluster"
       min_n_cells_celltype: 20
-      n_cells: 250
+      n_cells: 1000
+      max_n_pcs: 10
+      max_n_neighbours: 6
+    - name: Andy Spatial
+      query_path: /home/gruengroup/christian/Data/benchmark_sample_data/andy_spatial_downsampled.h5ad
+      query_cluster_key: "nico_ct"
+      reference_path: /home/gruengroup/christian/Data/benchmark_sample_data/andy_reference_downsampled.h5ad
+      reference_cluster_key: "simple_annot"
+      min_n_cells_celltype: 20
+      n_cells: 1000
+      max_n_pcs: 10
+      max_n_neighbours: 6
+    - type: spatial
+      name: Jennifer Spatial
+      query_path: /home/gruengroup/christian/Data/benchmark_sample_data/jennifer_spatial_downsampled.h5ad
+      query_cluster_key: Tacco_pred_cell_type
+      reference_path: /home/gruengroup/christian/Data/benchmark_sample_data/jennifer_reference_downsampled.h5ad
+      reference_cluster_key: cell_type
+      min_n_cells_celltype: 20
+      n_cells: 1000
       max_n_pcs: 10
       max_n_neighbours: 6

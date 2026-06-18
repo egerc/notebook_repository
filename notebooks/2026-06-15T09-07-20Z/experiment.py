@@ -14,6 +14,7 @@ import numpy as np
 import pydantic
 import sqlmodel
 import yaml
+import scanpy as sc
 from anndata import read_h5ad
 from anndata.typing import AnnData
 from nico2_lib.typing import IndexArray, NumericArray
@@ -51,7 +52,6 @@ class NmfConfig:
     alpha_W: float = 0
     alpha_H: float | Literal["same"] = "same"
     l1_ratio: float = 0
-    preprocessing_steps: Sequence[Callable[[NumericArray], NumericArray]] | None = None
     pre_init: bool = False
     solver: Literal["cd", "mu"] = "cd"
     beta_loss: str = "frobenius"
@@ -87,7 +87,6 @@ class NmfConfig:
             alpha_W=self.alpha_W,
             alpha_H=self.alpha_H,
             l1_ratio=self.l1_ratio,
-            preprocessing_steps=self.preprocessing_steps,
             pre_init=self.pre_init,
             solver=self.solver,
             beta_loss=self.beta_loss,
@@ -110,6 +109,7 @@ class PcaConfig:
 class PredictorConfig:
     name: str
     scope: Literal["global", "celltype"]
+    transform: Literal["log"] | None
     model: Annotated[
         NmfConfig | PcaConfig | ScviConfig,
         pydantic.Field(discriminator="type"),
@@ -333,6 +333,9 @@ def generate_datasets(
             dataset_config.load_reference(),
             dataset_config.load_query(),
         )
+        if dataset_config.n_cells is not None:
+            sc.pp.subsample(reference, n_obs=min(reference.n_obs, dataset_config.n_cells))
+            sc.pp.subsample(query, n_obs=min(query.n_obs, dataset_config.n_cells))
         reference, query = _adata_dense_mut(reference), _adata_dense_mut(query)
         shared_celltypes: list[str] = list(
             set(reference.obs[dataset_config.reference_cluster_key]).intersection(
@@ -388,9 +391,9 @@ def generate_celltypes(
             query.obs[dataset_config.query_cluster_key] == celltype_name
         ].X
         if issparse(query_counts_matrix):
-            query_counts_matrix = query_counts_matrix.toarray()
+            query_counts_matrix = query_counts_matrix.toarray()  # type: ignore
         if issparse(reference_counts_matrix):
-            reference_counts_matrix = reference_counts_matrix.toarray()
+            reference_counts_matrix = reference_counts_matrix.toarray()  # type: ignore
 
         if (
             reference_counts_matrix.shape[0] < dataset_config.min_n_cells_celltype  # type: ignore
@@ -539,9 +542,14 @@ def main() -> None:
                             f"Fitting model {model.name} on dataset {dataset.name}"
                         )
                         predictor = predictor_config.model.instantiate_model()
+                        transform = (
+                            np.log1p
+                            if predictor_config.transform == "log"
+                            else lambda x: x
+                        )
                         match predictor_config.scope:
                             case "global":
-                                predictor = predictor.fit(reference.X)  # type: ignore
+                                predictor = predictor.fit(transform(reference.X))  # type: ignore
                                 my_generator = (
                                     (celltype, predictor) for celltype in celltypes
                                 )
@@ -549,7 +557,9 @@ def main() -> None:
                                 my_generator = (
                                     (
                                         celltype,
-                                        predictor.fit(celltype.reference_counts_matrix),
+                                        predictor.fit(
+                                            transform(celltype.reference_counts_matrix)
+                                        ),
                                     )
                                     for celltype in celltypes
                                 )
@@ -558,15 +568,21 @@ def main() -> None:
                         ):
                             model_embedding_query, model_counts_query = (
                                 predictor_protocol.predict(
-                                    x=celltype.query_counts_matrix[:, sample.train_idx],
+                                    x=transform(
+                                        celltype.query_counts_matrix[
+                                            :, sample.train_idx
+                                        ]
+                                    ),
                                     indexer=sample.train_idx,
                                 )
                             )
                             model_embedding_reference, model_counts_reference = (
                                 predictor_protocol.predict(
-                                    x=celltype.reference_counts_matrix[
-                                        :, sample.train_idx
-                                    ],
+                                    x=transform(
+                                        celltype.reference_counts_matrix[
+                                            :, sample.train_idx
+                                        ]
+                                    ),
                                     indexer=sample.train_idx,
                                 )
                             )
@@ -589,6 +605,7 @@ def main() -> None:
                             logger.info(
                                 f"Added result for sample {sample.id_of_sample}, dataset {dataset.name}, celltype {celltype.name} and model {model.name}"
                             )
+                            session.commit()
                 logger.info("Committing results")
                 session.commit()
                 mlflow.log_artifact(sqlite_folder_path)
