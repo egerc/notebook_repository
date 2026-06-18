@@ -42,7 +42,7 @@ requires-dist = [
     { name = "ipython", specifier = ">=9.13.0" },
     { name = "marimo", specifier = ">=0.23.8" },
     { name = "mlflow", specifier = ">=3.11.1" },
-    { name = "nico2-lib", git = "https://github.com/gruenlab/bioinfo-tools.git?subdirectory=applications%2Fnico2_lib&rev=b32663a6bff521ba6494e657aa35fc32f66c6aa8" },
+    { name = "nico2-lib", git = "https://github.com/gruenlab/bioinfo-tools.git?subdirectory=applications%2Fnico2_lib&rev=2319da6bf21486bcf5780c39f3f33a7d5bf30a85" },
     { name = "numpy", specifier = ">=2.4.6" },
     { name = "pandas", specifier = ">=2.3.3" },
     { name = "plotly", specifier = ">=6.8.0" },
@@ -2741,7 +2741,7 @@ wheels = [
 [[package]]
 name = "nico2-lib"
 version = "0.1.0"
-source = { git = "https://github.com/gruenlab/bioinfo-tools.git?subdirectory=applications%2Fnico2_lib&rev=b32663a6bff521ba6494e657aa35fc32f66c6aa8#b32663a6bff521ba6494e657aa35fc32f66c6aa8" }
+source = { git = "https://github.com/gruenlab/bioinfo-tools.git?subdirectory=applications%2Fnico2_lib&rev=2319da6bf21486bcf5780c39f3f33a7d5bf30a85#2319da6bf21486bcf5780c39f3f33a7d5bf30a85" }
 dependencies = [
     { name = "anndata" },
     { name = "ipykernel" },

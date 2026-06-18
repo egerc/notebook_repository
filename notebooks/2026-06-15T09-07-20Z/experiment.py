@@ -300,12 +300,13 @@ class Result(sqlmodel.SQLModel, table=True):
 
 
 def _adata_dense_mut(adata: AnnData) -> AnnData:
-    if issparse(adata.X):
+    counts = adata.X
+    assert counts is not None, "adata.X is None"
+    if issparse(counts):
         # .toarray() works on both matrices and views
-        adata.X = adata.X.toarray()  # type: ignore
-        return adata
-    else:
-        return adata
+        adata.X = counts.toarray()  # type: ignore
+    adata.X = counts.astype(np.float64)  # type: ignore
+    return adata
 
 
 def generate_datasets(
@@ -562,6 +563,8 @@ def main() -> None:
                                 model_counts_query=model_counts_query,
                                 model_feature_embedding=model_feature_embedding,
                                 model=model,
+                                celltype=celltype,
+                                sample=sample
                             )
                             session.add(result)
                             logger.info(
