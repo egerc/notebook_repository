@@ -1,0 +1,4 @@
+#!/bin/bash
+
+FIRST_JOB_ID=$(sbatch experiment.sbatch | awk '{print $4}')
+sbatch --dependency=afterok:$FIRST_JOB_ID postprocessing.sbatch

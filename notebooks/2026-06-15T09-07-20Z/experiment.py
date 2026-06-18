@@ -29,6 +29,19 @@ from umap import UMAP
 
 
 @dataclass(frozen=True, slots=True)
+class ScviConfig:
+    type: Literal["scvi"]
+    n_factors: int | None = None
+    max_epochs: int = 200
+
+    def instantiate_model(self) -> n2l.pd.ScviPredictor:
+        return n2l.pd.ScviPredictor(
+            n_factors=self.n_factors,
+            max_epochs=self.max_epochs,
+        )
+
+
+@dataclass(frozen=True, slots=True)
 class NmfConfig:
     type: Literal["nmf"]
     n_components: PositiveInt | Literal["consensus", "knee"] | None
@@ -98,7 +111,7 @@ class PredictorConfig:
     name: str
     scope: Literal["global", "celltype"]
     model: Annotated[
-        NmfConfig | PcaConfig,
+        NmfConfig | PcaConfig | ScviConfig,
         pydantic.Field(discriminator="type"),
     ]
 
@@ -374,6 +387,11 @@ def generate_celltypes(
         query_counts_matrix = query[
             query.obs[dataset_config.query_cluster_key] == celltype_name
         ].X
+        if issparse(query_counts_matrix):
+            query_counts_matrix = query_counts_matrix.toarray()
+        if issparse(reference_counts_matrix):
+            reference_counts_matrix = reference_counts_matrix.toarray()
+
         if (
             reference_counts_matrix.shape[0] < dataset_config.min_n_cells_celltype  # type: ignore
             or query_counts_matrix.shape[0] < dataset_config.min_n_cells_celltype  # type: ignore
@@ -418,6 +436,7 @@ def generate_celltypes(
             query_umap_embedding=query_umap_embedding,  # type: ignore
             reference_adjacency_matrix=reference_adjacency_matrix,
             query_adjacency_matrix=query_adjacency_matrix,
+            dataset=dataset,
         )
 
 
@@ -564,7 +583,7 @@ def main() -> None:
                                 model_feature_embedding=model_feature_embedding,
                                 model=model,
                                 celltype=celltype,
-                                sample=sample
+                                sample=sample,
                             )
                             session.add(result)
                             logger.info(

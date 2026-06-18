@@ -1,0 +1,13 @@
+#!/bin/bash
+
+set -e
+
+
+srun \
+  --job-name=debug_postprocessing \
+  --mem=64G \
+  --cpus-per-task=8 \
+  --gres=gpu:1 \
+  --time=02:00:00 \
+  --pty \
+  uv run ipython -i postprocessing.py --pdb
