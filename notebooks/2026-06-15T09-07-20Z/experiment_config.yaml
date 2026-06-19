@@ -12,9 +12,31 @@ mlflow_config:
     description: ~
     log_system_metrics: ~
 sampling_config:
-    n_samples: 1
+    n_samples: 2
     sample_length: 20
 predictors:
+    - name: MofaFlex (3 components)
+      scope: celltype
+      transform: ~
+      model:
+          type: mofaflex
+          n_components: 3
+    - name: MofaFlex (3 components)
+      scope: global
+      transform: ~
+      model:
+          type: mofaflex
+          n_components: 3
+    - name: Tangram
+      scope: global
+      transform: ~
+      model:
+          type: tangram
+    - name: Tangram
+      scope: celltype
+      transform: ~
+      model:
+          type: tangram
     - name: NMF (3 components)
       scope: celltype
       transform: ~
@@ -29,19 +51,19 @@ predictors:
           n_components: 3
     - name: NMF (5 components)
       scope: celltype
-      transform: ~
+      transform: log
       model:
           type: nmf
           n_components: 5
     - name: NMF (5 components)
       scope: global
-      transform: ~
+      transform: log
       model:
           type: nmf
           n_components: 5
     - name: NMF (10 components)
       scope: celltype
-      transform: ~
+      transform: log
       model:
           type: nmf
           n_components: 10
@@ -51,18 +73,6 @@ predictors:
       model:
           type: nmf
           n_components: 10
-    - name: NMF (Knee)
-      scope: celltype
-      transform: ~
-      model:
-          type: nmf
-          n_components: knee
-    - name: NMF (Knee)
-      scope: global
-      transform: ~
-      model:
-          type: nmf
-          n_components: knee
     - name: NMF (Consensus)
       scope: celltype
       transform: ~
@@ -132,7 +142,7 @@ datasets:
       reference_path: "/home/gruengroup/christian/Projects/notebook_repository/notebooks/data/mouse_small_intestine_sc/mouse_small_intestine_sc.h5ad"
       reference_cluster_key: "cluster"
       min_n_cells_celltype: 20
-      n_cells: 1000
+      n_cells: 500
       max_n_pcs: 10
       max_n_neighbours: 6
     - name: Andy Spatial
@@ -141,7 +151,7 @@ datasets:
       reference_path: /home/gruengroup/christian/Data/benchmark_sample_data/andy_reference_downsampled.h5ad
       reference_cluster_key: "simple_annot"
       min_n_cells_celltype: 20
-      n_cells: 1000
+      n_cells: 500
       max_n_pcs: 10
       max_n_neighbours: 6
     - type: spatial
@@ -151,6 +161,6 @@ datasets:
       reference_path: /home/gruengroup/christian/Data/benchmark_sample_data/jennifer_reference_downsampled.h5ad
       reference_cluster_key: cell_type
       min_n_cells_celltype: 20
-      n_cells: 1000
+      n_cells: 500
       max_n_pcs: 10
       max_n_neighbours: 6

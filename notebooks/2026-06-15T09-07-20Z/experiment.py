@@ -9,12 +9,13 @@ from tempfile import TemporaryDirectory
 from typing import Annotated, Any, Callable, Literal
 
 import mlflow
+import mofaflex
 import nico2_lib as n2l
 import numpy as np
 import pydantic
+import scanpy as sc
 import sqlmodel
 import yaml
-import scanpy as sc
 from anndata import read_h5ad
 from anndata.typing import AnnData
 from nico2_lib.typing import IndexArray, NumericArray
@@ -27,6 +28,26 @@ from scipy.sparse import issparse
 from sklearn.decomposition import PCA
 from sklearn.neighbors import kneighbors_graph
 from umap import UMAP
+
+
+@dataclass(frozen=True, slots=True)
+class MofaFlexConfig:
+    type: Literal["mofaflex"]
+    n_components: int
+
+    def instantiate_model(self) -> n2l.pd.MofaFlexClassicPredictor:
+        return n2l.pd.MofaFlexClassicPredictor(
+            n_components=self.n_components,
+            max_epochs=200,
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class TangramConfig:
+    type: Literal["tangram"]
+
+    def instantiate_model(self) -> n2l.pd.TangramPredictor:
+        return n2l.pd.TangramPredictor()
 
 
 @dataclass(frozen=True, slots=True)
@@ -111,7 +132,7 @@ class PredictorConfig:
     scope: Literal["global", "celltype"]
     transform: Literal["log"] | None
     model: Annotated[
-        NmfConfig | PcaConfig | ScviConfig,
+        NmfConfig | PcaConfig | ScviConfig | TangramConfig | MofaFlexConfig,
         pydantic.Field(discriminator="type"),
     ]
 
@@ -274,6 +295,7 @@ class Model(sqlmodel.SQLModel, table=True):
 
     name: str
     scope: ModelScope
+    transform: str
 
     results: list["Result"] = sqlmodel.Relationship(back_populates="model")
 
@@ -285,13 +307,13 @@ class Result(sqlmodel.SQLModel, table=True):
     model_feature_embedding: NumericArray = sqlmodel.Field(
         sa_column=sqlmodel.Column(PklType)
     )
-    model_embedding_reference: NumericArray = sqlmodel.Field(
+    model_embedding_reference: NumericArray | None = sqlmodel.Field(
         sa_column=sqlmodel.Column(PklType)
     )
     model_counts_reference: NumericArray = sqlmodel.Field(
         sa_column=sqlmodel.Column(PklType)
     )
-    model_embedding_query: NumericArray = sqlmodel.Field(
+    model_embedding_query: NumericArray | None = sqlmodel.Field(
         sa_column=sqlmodel.Column(PklType)
     )
     model_counts_query: NumericArray = sqlmodel.Field(
@@ -313,12 +335,10 @@ class Result(sqlmodel.SQLModel, table=True):
 
 
 def _adata_dense_mut(adata: AnnData) -> AnnData:
-    counts = adata.X
-    assert counts is not None, "adata.X is None"
-    if issparse(counts):
-        # .toarray() works on both matrices and views
-        adata.X = counts.toarray()  # type: ignore
-    adata.X = counts.astype(np.float64)  # type: ignore
+    assert adata.X is not None, "adata.X is None"
+    if issparse(adata.X):
+        adata.X = adata.X.toarray()  # type: ignore
+    adata.X = adata.X.astype(np.float64)  # type: ignore
     return adata
 
 
@@ -334,7 +354,9 @@ def generate_datasets(
             dataset_config.load_query(),
         )
         if dataset_config.n_cells is not None:
-            sc.pp.subsample(reference, n_obs=min(reference.n_obs, dataset_config.n_cells))
+            sc.pp.subsample(
+                reference, n_obs=min(reference.n_obs, dataset_config.n_cells)
+            )
             sc.pp.subsample(query, n_obs=min(query.n_obs, dataset_config.n_cells))
         reference, query = _adata_dense_mut(reference), _adata_dense_mut(query)
         shared_celltypes: list[str] = list(
@@ -423,11 +445,11 @@ def generate_celltypes(
         reference_adjacency_matrix: NumericArray = kneighbors_graph(
             reference_pca_embedding,
             n_neighbors=n_neighbours,  # type: ignore
-        )  # type: ignore
+        ).toarray()  # type: ignore
         query_adjacency_matrix: NumericArray = kneighbors_graph(
             query_pca_embedding,
             n_neighbors=n_neighbours,  # type: ignore
-        )  # type: ignore
+        ).toarray()  # type: ignore
 
         yield Celltype(
             name=celltype_name,
@@ -453,10 +475,12 @@ def generate_models(
             case _:
                 scope = ModelScope.CELLTYPE
 
+        transform = predictor_config.transform
         yield (
             Model(
                 name=predictor_config.name,
                 scope=scope,
+                transform=transform if transform is not None else "raw",
             ),
             predictor_config,
         )

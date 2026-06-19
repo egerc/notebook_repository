@@ -12,7 +12,7 @@ from experiment import Result
 from nico2_lib.typing import NumericArray
 from numpy.typing import NDArray
 from pandas.io.parsers.python_parser import csv
-from sklearn.metrics import mean_squared_error
+from sklearn.metrics import explained_variance_score, mean_squared_error
 from sklearn.metrics.pairwise import cosine_similarity
 from sklearn.preprocessing import StandardScaler
 from sqlmodel import Session, create_engine, select
@@ -157,6 +157,11 @@ def create_embedding_evaluator(
     def pairwise_correlation_func(
         result: Result,
     ) -> tuple[float, float]:
+        if (
+            result.model_embedding_reference is None
+            or result.model_embedding_query is None
+        ):
+            return (np.nan, np.nan)
         return (
             average_pairwise_correlation_func(
                 result.model_embedding_reference,
@@ -175,6 +180,11 @@ def create_embedding_structure_evaluator(
     def structure_evaluator(
         result: Result,
     ) -> tuple[float, float]:
+        if (
+            result.model_embedding_reference is None
+            or result.model_embedding_query is None
+        ):
+            return (np.nan, np.nan)
         return (
             structure_function(
                 result.celltype.reference_adjacency_matrix,
@@ -204,6 +214,11 @@ def create_embedding_sparsity_evaluator(
     def embedding_sparsity_evaluator(
         result: Result,
     ) -> tuple[float, float]:
+        if (
+            result.model_embedding_reference is None
+            or result.model_embedding_query is None
+        ):
+            return (np.nan, np.nan)
         embedding_sparsity_func = make_aggregate_cellwise_metric_func(
             sparsity_func,
         )
@@ -232,6 +247,11 @@ def create_coverage_sparsity_evaluator(
     def coverage_sparsity_evaluator(
         result: Result,
     ) -> tuple[float, float]:
+        if (
+            result.model_embedding_reference is None
+            or result.model_embedding_query is None
+        ):
+            return (np.nan, np.nan)
         max_agg_sparsity_func = make_max_aggregate_featurewise_metric_func(
             sparsity_func,
         )
@@ -318,6 +338,9 @@ def compute_factor_gene_correlations(
 
 
 def enrichment_score_evaluator(result: Result) -> tuple[float, float]:
+    if result.model_embedding_reference is None or result.model_embedding_query is None:
+        return (np.nan, np.nan)
+
     enrichment_db_name = "KEGG_2026"
     gene_programs_db = get_gene_programs_db(name=enrichment_db_name)
     database_gene_names = extract_gene_list(gene_programs_db=gene_programs_db)
@@ -358,6 +381,27 @@ def enrichment_score_evaluator(result: Result) -> tuple[float, float]:
     )
 
 
+def explained_variance_evaluator(
+    result: Result,
+) -> tuple[float, float]:
+    def explained_variance_func(arr1: NumericArray, arr2: NumericArray) -> float:
+        if np.any(np.isnan(arr1)) or np.any(np.isnan(arr2)):
+            return np.nan
+            logging.warning("NaN values encountered in MSE calculation")
+        return float(explained_variance_score(arr1, arr2))
+
+    return (
+        explained_variance_func(
+            result.model_counts_reference[:, result.sample.test_idx],
+            result.celltype.reference_counts_matrix[:, result.sample.test_idx],
+        ),
+        explained_variance_func(
+            result.model_counts_query[:, result.sample.test_idx],
+            result.celltype.query_counts_matrix[:, result.sample.test_idx],
+        ),
+    )
+
+
 def mean_squared_error_evaluator(
     result: Result,
 ) -> tuple[float, float]:
@@ -379,6 +423,13 @@ def mean_squared_error_evaluator(
     )
 
 
+def compose[T, U, V](  # type: ignore
+    a: Callable[[U], V],
+    b: Callable[[T], U],
+) -> Callable[[T], V]:
+    return lambda x: a(b(x))
+
+
 METRIC_FNS: dict[
     str,
     dict[
@@ -392,13 +443,13 @@ METRIC_FNS: dict[
     "embedding_autocorrelation": {
         "pearsonr": (
             create_embedding_evaluator(n2l.mt.pearson_metric),  # type: ignore
-            tent,
+            compose(lambda x: x + 1, tent),
         ),
     },
     "embedding_structure": {
         "multivariate_gearys_c": (
             create_embedding_structure_evaluator(compute_multivariate_geary),
-            negative,
+            lambda x: float(np.exp(-x)),
         ),
     },
     "embedding_sparsity": {
@@ -410,21 +461,25 @@ METRIC_FNS: dict[
     "coverage": {
         "gini": (
             create_coverage_sparsity_evaluator(gini),
-            negative,
+            compose(lambda x: x + 1, negative),
         ),
         # "entropy": (create_coverage_sparsity_evaluator(entropy), identity),
     },
     "biological_enrichment": {
         "max_cosine_alignment": (
             enrichment_score_evaluator,
-            identity,
+            lambda x: np.clip(x, 0, 1),
         )
     },
     "feature_prediction_performance": {
         "mean_squared_error": (
             mean_squared_error_evaluator,
-            negative,
-        )
+            lambda x: float(np.exp(-x)),
+        ),
+        "explained_variance": (
+            explained_variance_evaluator,
+            lambda x: float(max(0.0, x)),
+        ),
     },
 }
 
@@ -444,6 +499,8 @@ def main():
     if runs.empty:  # type: ignore
         raise RuntimeError(f"No runs found in experiment '{exp_name}'.")
     last_run_id = runs.sort_values("start_time", ascending=False)["run_id"].iloc[0]  # type: ignore
+    # last_run_id = "15c787b577f0484aa8391bcb0b06e095"
+    # logger.warning("last_run_id variable overridden")
     logger.info(f"Using run_id: {last_run_id}")
     logger.info("Downloading 'database.db'...")
     database_path = mlflow.artifacts.download_artifacts(  # type: ignore
@@ -464,6 +521,7 @@ def main():
         "celltype",
         "sample_id",
         "model_name",
+        "transform",
         "metric_category",
         "function_name",
         "model_scope",
@@ -497,6 +555,7 @@ def main():
                                     "celltype": result.celltype.name,
                                     "sample_id": result.sample.id_of_sample,
                                     "model_name": result.model.name,
+                                    "transform": result.model.transform,
                                     "metric_category": metric_category,
                                     "function_name": function_name,
                                     "model_scope": result.model.scope,

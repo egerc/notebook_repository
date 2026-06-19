@@ -3,7 +3,7 @@ name = "2026-06-15t09-07-20z"
 version = "0.1.0"
 requires-python = ">=3.12"
 dependencies = [
-    "nico2-lib @ git+https://github.com/gruenlab/bioinfo-tools.git@b939aabb14e93283543d633886393e4f18328df1#subdirectory=applications/nico2_lib",
+    "nico2-lib @ git+https://github.com/gruenlab/bioinfo-tools.git@135cda59c7dd9f886384b311627886fe1b743564#subdirectory=applications/nico2_lib",
     "altair>=6.1.0",
     "ipython>=9.13.0",
     "marimo>=0.23.8",

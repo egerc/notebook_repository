@@ -1,6 +1,6 @@
 import marimo
 
-__generated_with = "0.23.8"
+__generated_with = "0.23.9"
 app = marimo.App(width="columns")
 
 
@@ -45,8 +45,8 @@ def _():
 
 
 @app.cell
-def _(df, mo):
-    mo.ui.data_explorer(df)
+def _(df):
+    df
     return
 
 
@@ -71,7 +71,9 @@ def _(df, plt, sns):
     )
 
     g.set_axis_labels("Model Architecture", "Metric Value", fontweight="bold")
-    g.set_titles(row_template="{row_name}", col_template="{col_name}", weight="bold")
+    g.set_titles(
+        row_template="{row_name}", col_template="{col_name}", weight="bold"
+    )
 
     # g.add_legend(
     #    title="Dataset Split",
@@ -92,6 +94,7 @@ def _(df, plt, sns):
 def _(pd):
     import plotly.graph_objects as go
     from plotly.graph_objs._figure import Figure
+
 
     def radar_plot_multi(
         df: pd.DataFrame,
@@ -144,16 +147,28 @@ def _(pd):
 
 
 @app.cell
-def _(df, normalization_function, radar_plot_multi):
-    fig_1 = radar_plot_multi(
-        df=df.query("model_scope_data_split == 'celltype query'").assign(
+def _(df, mo, normalization_function):
+    mo.ui.data_explorer(
+        df.assign(
             value_transformed_normalized=lambda x: x.groupby(["metric"])[
                 "value_transformed"
             ].transform(normalization_function)
+        )
+    )
+    return
+
+
+@app.cell
+def _(df, radar_plot_multi):
+    fig_1 = radar_plot_multi(
+        df=df.assign(
+            value_transformed_normalized=lambda x: x.groupby(["metric"])[
+                "value_transformed"
+            ].transform(lambda x: x)
         ),
         x="metric",
         y="value_transformed_normalized",
-        hue="model_name",
+        hue="model_scope",
     )
     fig_1.show()
     return
