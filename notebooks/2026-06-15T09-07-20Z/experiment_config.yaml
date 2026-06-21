@@ -12,7 +12,7 @@ mlflow_config:
     description: ~
     log_system_metrics: ~
 sampling_config:
-    n_samples: 2
+    n_samples: 4
     sample_length: 20
 predictors:
     - name: MofaFlex (3 components)
@@ -135,6 +135,34 @@ predictors:
           type: scvi
           n_components: 3
           max_epochs: 200
+    - name: scVI (5 Components)
+      scope: global
+      transform: ~
+      model:
+          type: scvi
+          n_components: 5
+          max_epochs: 200
+    - name: scVI (5 Components)
+      scope: celltype
+      transform: ~
+      model:
+          type: scvi
+          n_components: 5
+          max_epochs: 200
+    - name: scVI (10 Components)
+      scope: global
+      transform: ~
+      model:
+          type: scvi
+          n_components: 10
+          max_epochs: 200
+    - name: scVI (10 Components)
+      scope: celltype
+      transform: ~
+      model:
+          type: scvi
+          n_components: 10
+          max_epochs: 200
 datasets:
     - name: "Mouse Intestine"
       query_path: "/home/gruengroup/christian/Data/mouse_intestine/intestine_MERFISH.h5ad"
@@ -142,7 +170,7 @@ datasets:
       reference_path: "/home/gruengroup/christian/Projects/notebook_repository/notebooks/data/mouse_small_intestine_sc/mouse_small_intestine_sc.h5ad"
       reference_cluster_key: "cluster"
       min_n_cells_celltype: 20
-      n_cells: 500
+      n_cells: 2500
       max_n_pcs: 10
       max_n_neighbours: 6
     - name: Andy Spatial
@@ -151,7 +179,7 @@ datasets:
       reference_path: /home/gruengroup/christian/Data/benchmark_sample_data/andy_reference_downsampled.h5ad
       reference_cluster_key: "simple_annot"
       min_n_cells_celltype: 20
-      n_cells: 500
+      n_cells: 2500
       max_n_pcs: 10
       max_n_neighbours: 6
     - type: spatial
@@ -161,6 +189,6 @@ datasets:
       reference_path: /home/gruengroup/christian/Data/benchmark_sample_data/jennifer_reference_downsampled.h5ad
       reference_cluster_key: cell_type
       min_n_cells_celltype: 20
-      n_cells: 500
+      n_cells: 2500
       max_n_pcs: 10
       max_n_neighbours: 6
