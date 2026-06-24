@@ -1,0 +1,15 @@
+[project]
+name = "2026-06-22t12-32-06z"
+version = "0.1.0"
+requires-python = ">=3.12"
+dependencies = [
+    "ipython>=9.14.1",
+    "marimo>=0.23.10",
+    "nico2-lib",
+    "pydantic>=2.13.4",
+    "pyright>=1.1.410",
+    "ruff>=0.15.18",
+]
+
+[tool.uv.sources]
+nico2-lib = { git = "https://github.com/gruenlab/bioinfo-tools.git", subdirectory = "applications/nico2_lib", rev = "135cda59c7dd9f886384b311627886fe1b743564" }
