@@ -1,7 +1,7 @@
-from collections.abc import Iterable, Sequence
+from collections.abc import Generator, Iterable, Mapping, Sequence
 from dataclasses import replace
 from enum import Enum, auto
-from itertools import groupby
+from itertools import groupby, product
 from typing import Callable, Literal, assert_never
 
 import numpy as np
@@ -16,7 +16,6 @@ type H5adData = tuple[str, str]
 
 @dataclass(frozen=True, slots=True)
 class SpatialSubpanel:
-    dataset_setup: Literal["SpatialSubpanel"]
     name: str
     query_h5ad: H5adData
     reference_h5ad: H5adData
@@ -27,7 +26,6 @@ class SpatialSubpanel:
 
 @dataclass(frozen=True, slots=True)
 class PseudospatialSubpanel:
-    dataset_setup: Literal["PseudospatialSubpanel"]
     name: str
     h5ad: H5adData
     panel_size: int
@@ -38,7 +36,6 @@ class PseudospatialSubpanel:
 
 @dataclass(frozen=True, slots=True)
 class PseudospatialFull:
-    dataset_setup: Literal["PseudospatialFull"]
     name: str
     h5ad: H5adData
     panel_size: int
@@ -103,13 +100,14 @@ class ExperimentConfig:
 
 @dataclass(frozen=True, slots=True)
 class ExperimentResult:
-    name: str | None
-    dataset_name: str
-    fold: int
+    dataset: Dataset
+    sample_id: int
     celltype: str
-    preprocessing: str
-    score_in_raw: bool
-    scoring_axis: Literal["CELL", "GENE"]
+    preprocessing_transformation: PreprocessingTransformation
+    aggregation_type: AggregationType
+    scoring_axis: ScoringAxis
+    statistical_measure: StatisticalMeasure
+    value: float
 
 
 def extract_dense_counts(adata: AnnData) -> NumericArray:
@@ -155,11 +153,10 @@ def combine_adatas(
 def process_dataset(dataset: Dataset):
     match dataset:
         case SpatialSubpanel(
-            dataset_setup,
             name,
             (query_h5ad_path, query_h5ad_cluster_key),
             (reference_h5ad_path, reference_h5ad_cluster_key),
-            panel_size,
+            subpanel_size,
             n_samples,
             seed,
         ):
@@ -175,9 +172,11 @@ def process_dataset(dataset: Dataset):
                 reference_adata,
                 reference_h5ad_cluster_key,
             )
+            raise Warning(
+                f"make sure samples are correctly generated, eg the size of the predicted features is {subpanel_size}"
+            )
 
         case PseudospatialSubpanel(
-            dataset_setup,
             name,
             (h5ad_path, cluster_key),
             n_genes_total,
@@ -205,7 +204,6 @@ def process_dataset(dataset: Dataset):
             celltype_annotation: list[str] = adata.obs[cluster_key].tolist()
 
         case PseudospatialFull(
-            dataset_setup,
             name,
             (h5ad_path, cluster_key),
             panel_size,
@@ -215,8 +213,9 @@ def process_dataset(dataset: Dataset):
             rng = np.random.default_rng(seed)
             adata = read_h5ad(h5ad_path)
             counts = extract_dense_counts(adata)
+            n_cells, n_genes = counts.shape
             split_annotation: list[Literal["train", "test"]] = rng.choice(
-                ["train", "test"], size=counts.shape[0], p=[0.8, 0.2]
+                ["train", "test"], size=n_cells, p=[0.8, 0.2]
             ).tolist()
             celltype_annotation: list[str] = adata.obs[cluster_key].tolist()
 
@@ -227,7 +226,6 @@ def process_dataset(dataset: Dataset):
         rng.choice(counts.shape[1], panel_size, replace=False) for _ in range(n_samples)
     ]
     return (
-        dataset_setup,
         name,
         counts,
         split_annotation,
@@ -236,20 +234,74 @@ def process_dataset(dataset: Dataset):
     )
 
 
-def test(
+def make_scorer(
+    scoring_axis: ScoringAxis,
+    aggregation_type: AggregationType,
+    statistical_measure: StatisticalMeasure,
+) -> Callable[[NumericArray, NumericArray], float]:
+    transpose_func: Callable[[NumericArray], NumericArray]
+    match scoring_axis:
+        case ScoringAxis.CELL:
+            transpose_func = lambda x: x
+        case ScoringAxis.GENE:
+            transpose_func = lambda x: x.T
+        case _:
+            assert_never(scoring_axis)
+    raise NotImplementedError
+
+
+def expand_configurations(
+    datasets: Sequence[Dataset],
+    preprocessing_transformations: Sequence[PreprocessingTransformation],
+    scoring_axes: Sequence[ScoringAxis],
+    aggregation_types: Sequence[AggregationType],
+    statistical_measures: Sequence[StatisticalMeasure],
+) -> list[ExperimentConfig]:
+    return [
+        ExperimentConfig(
+            dataset=dataset,
+            preprocessing=preprocess,
+            scoring_axis=scoring_axis,
+            aggregation_type=aggregation_type,
+            statistical_measure=statistical_measure,
+        )
+        for dataset, preprocess, scoring_axis, aggregation_type, statistical_measure in product(
+            datasets,
+            preprocessing_transformations,
+            scoring_axes,
+            aggregation_types,
+            statistical_measures,
+        )
+    ]
+
+
+def run_experiment(
     experiment_configs: Sequence[ExperimentConfig],
-):
+) -> Generator[ExperimentResult]:
     for dataset, dataset_configs in groupby(
         experiment_configs, key=lambda x: x.dataset
     ):
-        for preprocessing, preprocessing_configs in groupby(
-            dataset_configs, key=lambda x: x.preprocessing
+        (
+            name,
+            counts,
+            split_annotation,
+            celltype_annotation,
+            gene_samples,
+        ) = process_dataset(dataset)
+        celltypes = list(set(celltype_annotation))
+        for celltype, (sample_id, gene_sample), (
+            preprocessing_transformation,
+            preprocessing_configs,
+        ) in product(
+            celltypes,
+            enumerate(gene_samples),
+            groupby(dataset_configs, key=lambda x: x.preprocessing),
         ):
             for (
                 scoring_axis,
                 aggregation_type,
                 statistical_measure,
-            ), scoring_configs in groupby(
+            ), _ in groupby(
                 preprocessing_configs,
                 key=lambda x: (
                     x.scoring_axis,
@@ -257,12 +309,29 @@ def test(
                     x.statistical_measure,
                 ),
             ):
-                pass
+                yield ExperimentResult(
+                    dataset=dataset,
+                    sample_id=sample_id,
+                    celltype=celltype,
+                    preprocessing_transformation=preprocessing_transformation,
+                    aggregation_type=aggregation_type,
+                    scoring_axis=scoring_axis,
+                    statistical_measure=statistical_measure,
+                    value=0.0,
+                )
+
+
+def run_targeted_experiment(
+    grouped_experiment_configs: Mapping[str, list[ExperimentConfig]],
+) -> Generator[tuple[str, ExperimentResult]]:
+    for name, experiment_configs in grouped_experiment_configs.items():
+        for experiment_result in run_experiment(experiment_configs):
+            yield name, experiment_result
 
 
 def main():
     import os
-    import pprint
+
     from dotenv import load_dotenv
 
     load_dotenv()
@@ -270,46 +339,25 @@ def main():
     query_cluster_key: str = os.getenv("QUERY_CLUSTER_KEY")  # type: ignore
     reference_h5ad: str = os.getenv("REFERENCE_H5AD")  # type: ignore
     reference_cluster_key: str = os.getenv("REFERENCE_CLUSTER_KEY")  # type: ignore
-    for dataset in [
-        SpatialSubpanel(
-            "SpatialSubpanel",
-            "test",
-            (query_h5ad, query_cluster_key),
-            (reference_h5ad, reference_cluster_key),
-            20,
-            2,
-            42,
-        ),
-        PseudospatialSubpanel(
-            "PseudospatialSubpanel",
-            "test2",
-            (reference_h5ad, reference_cluster_key),
-            500,
-            20,
-            2,
-            42,
-        ),
-        PseudospatialFull(
-            "PseudospatialFull",
-            "test3",
-            (reference_h5ad, reference_cluster_key),
-            500,
-            2,
-            42,
-        ),
-    ]:
-        (
-            dataset_setup,
-            name,
-            counts,
-            split_annotation,
-            celltype_annotation,
-            gene_samples,
-        ) = process_dataset(dataset)
-        print(
-            f"Processed {name} with setup {pprint.pformat(dataset)}: counts shape {counts.shape}, samples {len(gene_samples)} of length {gene_samples[0].size}, {len(split_annotation)=}, {len(celltype_annotation)=}"
-        )
-        breakpoint()
+    SPATIAL_SUBPANEL_PANEL_SIZE = 20
+    run_targeted_experiment(
+        [
+            {
+                "christian": expand_configurations(
+                    datasets=[
+                        SpatialSubpanel(subpanel_size=SPATIAL_SUBPANEL_PANEL_SIZE)
+                    ],
+                    preprocessing_transformations=[
+                        PreprocessingTransformation(np.log1p, np.expm1, False),
+                        PreprocessingTransformation(identity, identity, False),
+                    ],
+                    scoring_axes=[ScoringAxis.CELL],
+                    aggregation_types=[AggregationType.MEAN_SCORE_OF_EXPRESSION],
+                    statistical_measures=[StatisticalMeasure.COSINE_SIM],
+                ),
+            },
+        ]
+    )
 
 
 if __name__ == "__main__":
