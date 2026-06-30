@@ -9,6 +9,7 @@ dependencies = [
     "polars>=1.42.0",
     "pydantic>=2.13.4",
     "pyright>=1.1.410",
+    "python-dotenv>=1.2.2",
     "ruff>=0.15.18",
 ]
 
