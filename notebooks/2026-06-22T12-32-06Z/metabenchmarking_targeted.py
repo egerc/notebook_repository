@@ -1,73 +1,84 @@
+import sys
 from collections.abc import Generator, Iterable, Mapping, Sequence
 from dataclasses import replace
 from enum import Enum, auto
 from itertools import groupby, product
 from typing import Callable, Literal, assert_never
 
+import nico2_lib as n2l
 import numpy as np
 import scanpy as sc
 from anndata import read_h5ad
 from anndata.typing import AnnData
 from nico2_lib.typing import IndexArray, NumericArray
+from pandas.io.parsers.python_parser import csv
 from pydantic.dataclasses import dataclass
 
 type H5adData = tuple[str, str]
 
+type Predictor = n2l.pd.NmfPredictor | n2l.pd.TangramPredictor
+
 
 @dataclass(frozen=True, slots=True)
 class SpatialSubpanel:
-    name: str
-    query_h5ad: H5adData
-    reference_h5ad: H5adData
-    subpanel_size: int
+    sample_size: int
     n_samples: int
     seed: int | None
 
 
 @dataclass(frozen=True, slots=True)
 class PseudospatialSubpanel:
-    name: str
-    h5ad: H5adData
     panel_size: int
-    subpanel_size: int
+    sample_size: int
     n_samples: int
     seed: int | None
 
 
 @dataclass(frozen=True, slots=True)
 class PseudospatialFull:
-    name: str
-    h5ad: H5adData
     panel_size: int
     n_samples: int
     seed: int | None
 
 
-type Dataset = SpatialSubpanel | PseudospatialSubpanel | PseudospatialFull
+type Dataset = (
+    tuple[tuple[H5adData, H5adData], SpatialSubpanel]
+    | tuple[H5adData, PseudospatialSubpanel]
+    | tuple[H5adData, PseudospatialFull]
+)
 
 
-@dataclass(frozen=True, slots=True)
-class PreprocessingTransformation:
-    transform: Callable[[NumericArray], NumericArray]
-    inverse_transform: Callable[[NumericArray], NumericArray]
-    invert: bool
+class TransformationFunction(Enum):
+    LOG1P = auto()
+    EXPM1 = auto()
+
+
+def apply_transformation_func(
+    transform: TransformationFunction | None,
+    x: NumericArray,
+) -> NumericArray:
+    if transform is None:
+        return x
+    match transform:
+        case TransformationFunction.LOG1P:
+            return np.log1p(x)
+        case TransformationFunction.EXPM1:
+            return np.expm1(x)
+        case _:
+            assert_never(transform)
+
+
+type PreprocessingTransformation = (
+    tuple[
+        TransformationFunction,
+        TransformationFunction | None,
+    ]
+    | tuple[None, None]
+)
 
 
 def identity[T](input: T) -> T:
     return input
-
-
-class Preprocessing(Enum):
-    LOG1P = PreprocessingTransformation(
-        transform=np.log1p,
-        inverse_transform=np.expm1,
-        invert=True,
-    )
-    IDENTITY = PreprocessingTransformation(
-        transform=identity,
-        inverse_transform=identity,
-        invert=False,
-    )
 
 
 class ScoringAxis(Enum):
@@ -78,6 +89,7 @@ class ScoringAxis(Enum):
 class AggregationType(Enum):
     MEAN_SCORE_OF_EXPRESSION = auto()
     SCORE_OF_MEAN_EXPRESSION = auto()
+    SCORE_OF_RAVEL = auto()
 
 
 class StatisticalMeasure(Enum):
@@ -150,15 +162,25 @@ def combine_adatas(
     return extract_dense_counts(adata_concat), split_annotation, celltype_annotation
 
 
-def process_dataset(dataset: Dataset):
+def process_dataset(
+    dataset: Dataset,
+) -> tuple[
+    NumericArray,
+    list[Literal["train", "test"]],
+    list[str],
+    list[tuple[IndexArray, IndexArray]],
+]:
     match dataset:
-        case SpatialSubpanel(
-            name,
-            (query_h5ad_path, query_h5ad_cluster_key),
-            (reference_h5ad_path, reference_h5ad_cluster_key),
-            subpanel_size,
-            n_samples,
-            seed,
+        case (
+            (
+                (query_h5ad_path, query_h5ad_cluster_key),
+                (reference_h5ad_path, reference_h5ad_cluster_key),
+            ),
+            SpatialSubpanel(
+                sample_size,
+                n_samples,
+                seed,
+            ),
         ):
             query_adata, reference_adata = (
                 read_h5ad(query_h5ad_path),
@@ -172,24 +194,22 @@ def process_dataset(dataset: Dataset):
                 reference_adata,
                 reference_h5ad_cluster_key,
             )
-            raise Warning(
-                f"make sure samples are correctly generated, eg the size of the predicted features is {subpanel_size}"
-            )
 
-        case PseudospatialSubpanel(
-            name,
+        case (
             (h5ad_path, cluster_key),
-            n_genes_total,
-            panel_size,
-            n_samples,
-            seed,
+            PseudospatialSubpanel(
+                panel_size,
+                sample_size,
+                n_samples,
+                seed,
+            ),
         ):
             rng = np.random.default_rng(seed)
             adata = read_h5ad(h5ad_path)
             hvg_df = sc.pp.highly_variable_genes(
                 adata,
                 flavor="seurat_v3",
-                n_top_genes=n_genes_total,
+                n_top_genes=panel_size,
                 subset=True,
                 inplace=False,
             )
@@ -203,17 +223,19 @@ def process_dataset(dataset: Dataset):
             ).tolist()
             celltype_annotation: list[str] = adata.obs[cluster_key].tolist()
 
-        case PseudospatialFull(
-            name,
+        case (
             (h5ad_path, cluster_key),
-            panel_size,
-            n_samples,
-            seed,
+            PseudospatialFull(
+                panel_size,
+                n_samples,
+                seed,
+            ),
         ):
             rng = np.random.default_rng(seed)
             adata = read_h5ad(h5ad_path)
             counts = extract_dense_counts(adata)
             n_cells, n_genes = counts.shape
+            sample_size = n_genes - panel_size
             split_annotation: list[Literal["train", "test"]] = rng.choice(
                 ["train", "test"], size=n_cells, p=[0.8, 0.2]
             ).tolist()
@@ -222,16 +244,38 @@ def process_dataset(dataset: Dataset):
         case _:
             assert_never(dataset)
     rng = np.random.default_rng(seed)
-    gene_samples: list[IndexArray] = [
-        rng.choice(counts.shape[1], panel_size, replace=False) for _ in range(n_samples)
+
+    n_genes = counts.shape[1]
+    gene_samples: list[tuple[IndexArray, IndexArray]] = [  # type: ignore
+        tuple(np.split(rng.permutation(n_genes), [sample_size]))
+        for _ in range(n_samples)
     ]
     return (
-        name,
         counts,
         split_annotation,
         celltype_annotation,
         gene_samples,
     )
+
+
+def mean_score_of_expression(
+    statistical_measure: Callable[[NumericArray, NumericArray], float],
+) -> Callable[[NumericArray, NumericArray], float]:
+    return lambda x, y: np.array(
+        [statistical_measure(xi, yi) for xi, yi in zip(x, y)]
+    ).mean()
+
+
+def score_of_mean_expression(
+    statistical_measure: Callable[[NumericArray, NumericArray], float],
+) -> Callable[[NumericArray, NumericArray], float]:
+    return lambda x, y: statistical_measure(np.mean(x, axis=0), np.mean(y, axis=0))
+
+
+def score_of_ravel(
+    statistical_measure: Callable[[NumericArray, NumericArray], float],
+) -> Callable[[NumericArray, NumericArray], float]:
+    return lambda x, y: statistical_measure(x.ravel(), y.ravel())
 
 
 def make_scorer(
@@ -242,20 +286,51 @@ def make_scorer(
     transpose_func: Callable[[NumericArray], NumericArray]
     match scoring_axis:
         case ScoringAxis.CELL:
-            transpose_func = lambda x: x
+            transpose_func = identity
         case ScoringAxis.GENE:
-            transpose_func = lambda x: x.T
+            transpose_func = np.transpose
         case _:
             assert_never(scoring_axis)
-    raise NotImplementedError
+    aggregation_function: Callable[
+        [Callable[[NumericArray, NumericArray], float]],
+        Callable[[NumericArray, NumericArray], float],
+    ]
+    match aggregation_type:
+        case AggregationType.MEAN_SCORE_OF_EXPRESSION:
+            aggregation_function = mean_score_of_expression
+        case AggregationType.SCORE_OF_MEAN_EXPRESSION:
+            aggregation_function = score_of_mean_expression
+        case AggregationType.SCORE_OF_RAVEL:
+            aggregation_function = score_of_ravel
+        case _:
+            assert_never(aggregation_type)
+    statistical_measure_function: Callable[[NumericArray, NumericArray], float]
+    match statistical_measure:
+        case StatisticalMeasure.PEARSON:
+            statistical_measure_function = n2l.mt.pearson_metric  # type: ignore
+        case StatisticalMeasure.SPEARMAN:
+            statistical_measure_function = n2l.mt.spearman_metric  # type: ignore
+        case StatisticalMeasure.COSINE_SIM:
+            statistical_measure_function = n2l.mt.cosine_similarity_metric  # type: ignore
+        case StatisticalMeasure.MSE:
+            statistical_measure_function = n2l.mt.mse_metric  # type: ignore
+        case StatisticalMeasure.EXPLAINED_VARIANCE_1:
+            statistical_measure_function = n2l.mt.explained_variance_metric  # type: ignore
+        case StatisticalMeasure.EXPLAINED_VARIANCE_2:
+            statistical_measure_function = n2l.mt.explained_variance_metric_v2  # type: ignore
+        case _:
+            assert_never(statistical_measure)
+    return lambda x, y: aggregation_function(statistical_measure_function)(
+        transpose_func(x), transpose_func(y)
+    )
 
 
 def expand_configurations(
     datasets: Sequence[Dataset],
     preprocessing_transformations: Sequence[PreprocessingTransformation],
-    scoring_axes: Sequence[ScoringAxis],
-    aggregation_types: Sequence[AggregationType],
-    statistical_measures: Sequence[StatisticalMeasure],
+    scoring_configurations: Sequence[
+        tuple[ScoringAxis, AggregationType, StatisticalMeasure]
+    ],
 ) -> list[ExperimentConfig]:
     return [
         ExperimentConfig(
@@ -265,67 +340,96 @@ def expand_configurations(
             aggregation_type=aggregation_type,
             statistical_measure=statistical_measure,
         )
-        for dataset, preprocess, scoring_axis, aggregation_type, statistical_measure in product(
+        for dataset, preprocess, (
+            scoring_axis,
+            aggregation_type,
+            statistical_measure,
+        ) in product(
             datasets,
             preprocessing_transformations,
-            scoring_axes,
-            aggregation_types,
-            statistical_measures,
+            scoring_configurations,
         )
     ]
 
 
 def run_experiment(
+    predictor: Predictor | n2l.pd.PredictorProtocol,
     experiment_configs: Sequence[ExperimentConfig],
 ) -> Generator[ExperimentResult]:
     for dataset, dataset_configs in groupby(
         experiment_configs, key=lambda x: x.dataset
     ):
         (
-            name,
             counts,
             split_annotation,
             celltype_annotation,
             gene_samples,
         ) = process_dataset(dataset)
         celltypes = list(set(celltype_annotation))
-        for celltype, (sample_id, gene_sample), (
-            preprocessing_transformation,
-            preprocessing_configs,
-        ) in product(
-            celltypes,
-            enumerate(gene_samples),
-            groupby(dataset_configs, key=lambda x: x.preprocessing),
+        breakpoint()
+        for preprocessing_transformation, preprocessing_configs in groupby(
+            dataset_configs, key=lambda x: x.preprocessing
         ):
-            for (
-                scoring_axis,
-                aggregation_type,
-                statistical_measure,
-            ), _ in groupby(
-                preprocessing_configs,
-                key=lambda x: (
-                    x.scoring_axis,
-                    x.aggregation_type,
-                    x.statistical_measure,
-                ),
-            ):
-                yield ExperimentResult(
-                    dataset=dataset,
-                    sample_id=sample_id,
-                    celltype=celltype,
-                    preprocessing_transformation=preprocessing_transformation,
-                    aggregation_type=aggregation_type,
-                    scoring_axis=scoring_axis,
-                    statistical_measure=statistical_measure,
-                    value=0.0,
+            counts = apply_transformation_func(preprocessing_transformation[0], counts)
+
+            for celltype in celltypes:
+                celltype_mask = np.array(celltype_annotation) == celltype
+                train_mask, test_mask = (
+                    (np.array(split_annotation) == "train"),
+                    (np.array(split_annotation) == "test"),
                 )
+                predictor = predictor.fit(counts[train_mask & celltype_mask])
+                for sample_id, (testing_genes, training_genes) in enumerate(
+                    gene_samples
+                ):
+                    _, counts_pred = predictor.predict(
+                        counts[test_mask & celltype_mask][:, training_genes],
+                        training_genes,
+                    )
+                    for (
+                        scoring_axis,
+                        aggregation_type,
+                        statistical_measure,
+                    ), _ in groupby(
+                        preprocessing_configs,
+                        key=lambda x: (
+                            x.scoring_axis,
+                            x.aggregation_type,
+                            x.statistical_measure,
+                        ),
+                    ):
+                        scorer = make_scorer(
+                            scoring_axis, aggregation_type, statistical_measure
+                        )
+                        value = scorer(
+                            apply_transformation_func(
+                                preprocessing_transformation[1],
+                                counts[test_mask & celltype_mask][:, testing_genes],
+                            ),
+                            apply_transformation_func(
+                                preprocessing_transformation[1],
+                                counts_pred[:, testing_genes],
+                            ),
+                        )
+                        experiment_result = ExperimentResult(
+                            dataset=dataset,
+                            sample_id=sample_id,
+                            celltype=celltype,
+                            preprocessing_transformation=preprocessing_transformation,
+                            aggregation_type=aggregation_type,
+                            scoring_axis=scoring_axis,
+                            statistical_measure=statistical_measure,
+                            value=value,
+                        )
+                        yield experiment_result
 
 
 def run_targeted_experiment(
+    predictor: Predictor | n2l.pd.PredictorProtocol,
     grouped_experiment_configs: Mapping[str, list[ExperimentConfig]],
 ) -> Generator[tuple[str, ExperimentResult]]:
     for name, experiment_configs in grouped_experiment_configs.items():
-        for experiment_result in run_experiment(experiment_configs):
+        for experiment_result in run_experiment(predictor, experiment_configs):
             yield name, experiment_result
 
 
@@ -335,29 +439,78 @@ def main():
     from dotenv import load_dotenv
 
     load_dotenv()
-    query_h5ad: str = os.getenv("QUERY_H5AD")  # type: ignore
-    query_cluster_key: str = os.getenv("QUERY_CLUSTER_KEY")  # type: ignore
-    reference_h5ad: str = os.getenv("REFERENCE_H5AD")  # type: ignore
-    reference_cluster_key: str = os.getenv("REFERENCE_CLUSTER_KEY")  # type: ignore
-    SPATIAL_SUBPANEL_PANEL_SIZE = 20
-    run_targeted_experiment(
-        [
-            {
-                "christian": expand_configurations(
-                    datasets=[
-                        SpatialSubpanel(subpanel_size=SPATIAL_SUBPANEL_PANEL_SIZE)
-                    ],
-                    preprocessing_transformations=[
-                        PreprocessingTransformation(np.log1p, np.expm1, False),
-                        PreprocessingTransformation(identity, identity, False),
-                    ],
-                    scoring_axes=[ScoringAxis.CELL],
-                    aggregation_types=[AggregationType.MEAN_SCORE_OF_EXPRESSION],
-                    statistical_measures=[StatisticalMeasure.COSINE_SIM],
-                ),
-            },
-        ]
+    query_h5ad_data_intestine: H5adData = (  # type: ignore
+        os.getenv("QUERY_H5AD"),
+        os.getenv("QUERY_CLUSTER_KEY"),
     )
+    reference_h5ad_data_intestine: H5adData = (  # type: ignore
+        os.getenv("REFERENCE_H5AD"),
+        os.getenv("REFERENCE_CLUSTER_KEY"),
+    )
+    spatial_subpanel_config = SpatialSubpanel(
+        sample_size=20,
+        n_samples=10,
+        seed=0,
+    )
+
+    pseudospatial_full_config_250 = PseudospatialFull(
+        panel_size=250,
+        n_samples=10,
+        seed=0,
+    )
+    pseudospatial_full_config_500 = PseudospatialFull(
+        panel_size=500,
+        n_samples=10,
+        seed=0,
+    )
+    configurations = {
+        "christian": expand_configurations(
+            datasets=[
+                (
+                    (query_h5ad_data_intestine, reference_h5ad_data_intestine),
+                    spatial_subpanel_config,
+                ),
+            ],
+            preprocessing_transformations=[
+                (TransformationFunction.LOG1P, None),
+                (None, None),
+            ],
+            scoring_configurations=[
+                (
+                    ScoringAxis.CELL,
+                    AggregationType.MEAN_SCORE_OF_EXPRESSION,
+                    StatisticalMeasure.EXPLAINED_VARIANCE_1,
+                ),
+            ],
+        ),
+        "helene": expand_configurations(
+            datasets=[
+                (reference_h5ad_data_intestine, pseudospatial_full_config_500),
+                (reference_h5ad_data_intestine, pseudospatial_full_config_250),
+            ],
+            preprocessing_transformations=[
+                (TransformationFunction.LOG1P, None),
+                (TransformationFunction.LOG1P, TransformationFunction.EXPM1),
+                (None, None),
+            ],
+            scoring_configurations=[
+                (
+                    ScoringAxis.CELL,
+                    AggregationType.SCORE_OF_RAVEL,
+                    StatisticalMeasure.EXPLAINED_VARIANCE_2,
+                ),
+            ],
+        ),
+    }
+    with open("christian_helene_comparison.csv", "w", newline="", buffering=1) as f:
+        csv_writer = csv.DictWriter(f, fieldnames=)
+        for result in run_targeted_experiment(
+            predictor=n2l.pd.TangramPredictor(),
+            grouped_experiment_configs=configurations,
+        ):
+            pass
+
+    sys.exit(0)
 
 
 if __name__ == "__main__":
