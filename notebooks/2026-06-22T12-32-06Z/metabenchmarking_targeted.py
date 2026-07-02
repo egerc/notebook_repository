@@ -1,6 +1,9 @@
+import csv
+import logging
+import pprint
 import sys
-from collections.abc import Generator, Iterable, Mapping, Sequence
-from dataclasses import replace
+from collections import Counter
+from collections.abc import Generator, Mapping, Sequence
 from enum import Enum, auto
 from itertools import groupby, product
 from typing import Callable, Literal, assert_never
@@ -11,8 +14,8 @@ import scanpy as sc
 from anndata import read_h5ad
 from anndata.typing import AnnData
 from nico2_lib.typing import IndexArray, NumericArray
-from pandas.io.parsers.python_parser import csv
 from pydantic.dataclasses import dataclass
+from tqdm import tqdm
 
 type H5adData = tuple[str, str]
 
@@ -42,9 +45,9 @@ class PseudospatialFull:
 
 
 type Dataset = (
-    tuple[tuple[H5adData, H5adData], SpatialSubpanel]
-    | tuple[H5adData, PseudospatialSubpanel]
-    | tuple[H5adData, PseudospatialFull]
+    tuple[str, tuple[H5adData, H5adData], SpatialSubpanel]
+    | tuple[str, H5adData, PseudospatialSubpanel]
+    | tuple[str, H5adData, PseudospatialFull]
 )
 
 
@@ -113,6 +116,9 @@ class ExperimentConfig:
 @dataclass(frozen=True, slots=True)
 class ExperimentResult:
     dataset: Dataset
+    modality: str
+    prediction_scope: str
+    predictor_name: str
     sample_id: int
     celltype: str
     preprocessing_transformation: PreprocessingTransformation
@@ -162,16 +168,45 @@ def combine_adatas(
     return extract_dense_counts(adata_concat), split_annotation, celltype_annotation
 
 
+def filter_rare_celltypes(
+    celltype_annotation: list[str],
+    split_annotation: list[Literal["train", "test"]],
+    min_n_cells: int,
+) -> list[bool]:
+    "returns a mask for entries making sure both train and test split contain at least min_n_cells cells of a celltype"
+    train_counts = Counter(
+        cell
+        for cell, split in zip(celltype_annotation, split_annotation)
+        if split == "train"
+    )
+    test_counts = Counter(
+        cell
+        for cell, split in zip(celltype_annotation, split_annotation)
+        if split == "test"
+    )
+    valid_celltypes = {
+        cell
+        for cell in set(celltype_annotation)
+        if train_counts[cell] >= min_n_cells and test_counts[cell] >= min_n_cells
+    }
+    mask = [(cell in valid_celltypes) for cell in celltype_annotation]
+    breakpoint()
+    return mask
+
+
 def process_dataset(
     dataset: Dataset,
+    celltype_min_cells: int,
 ) -> tuple[
     NumericArray,
     list[Literal["train", "test"]],
     list[str],
     list[tuple[IndexArray, IndexArray]],
+    tuple[str, str],
 ]:
     match dataset:
         case (
+            _,
             (
                 (query_h5ad_path, query_h5ad_cluster_key),
                 (reference_h5ad_path, reference_h5ad_cluster_key),
@@ -194,8 +229,10 @@ def process_dataset(
                 reference_adata,
                 reference_h5ad_cluster_key,
             )
+            modality, prediction_scope = "spatial", "subpanel"
 
         case (
+            _,
             (h5ad_path, cluster_key),
             PseudospatialSubpanel(
                 panel_size,
@@ -222,8 +259,10 @@ def process_dataset(
                 ["train", "test"], size=counts.shape[0], p=[0.8, 0.2]
             ).tolist()
             celltype_annotation: list[str] = adata.obs[cluster_key].tolist()
+            modality, prediction_scope = "pseudospatial", "subpanel"
 
         case (
+            _,
             (h5ad_path, cluster_key),
             PseudospatialFull(
                 panel_size,
@@ -240,11 +279,24 @@ def process_dataset(
                 ["train", "test"], size=n_cells, p=[0.8, 0.2]
             ).tolist()
             celltype_annotation: list[str] = adata.obs[cluster_key].tolist()
+            modality, prediction_scope = "pseudospatial", "full"
 
         case _:
             assert_never(dataset)
     rng = np.random.default_rng(seed)
-
+    celltype_mask = filter_rare_celltypes(
+        celltype_annotation,
+        split_annotation,
+        celltype_min_cells,
+    )
+    counts = counts[celltype_mask]
+    celltype_annotation = [
+        ct for ct, keep in zip(celltype_annotation, celltype_mask) if keep
+    ]
+    split_annotation = [s for s, keep in zip(split_annotation, celltype_mask) if keep]
+    assert counts.shape[0] == len(split_annotation) == len(celltype_annotation), (
+        f"Counts shape mismatch: {counts.shape[0]} vs {len(split_annotation)} vs {len(celltype_annotation)}"
+    )
     n_genes = counts.shape[1]
     gene_samples: list[tuple[IndexArray, IndexArray]] = [  # type: ignore
         tuple(np.split(rng.permutation(n_genes), [sample_size]))
@@ -255,21 +307,30 @@ def process_dataset(
         split_annotation,
         celltype_annotation,
         gene_samples,
+        (modality, prediction_scope),
     )
 
 
 def mean_score_of_expression(
     statistical_measure: Callable[[NumericArray, NumericArray], float],
 ) -> Callable[[NumericArray, NumericArray], float]:
-    return lambda x, y: np.array(
-        [statistical_measure(xi, yi) for xi, yi in zip(x, y)]
-    ).mean()
+    def wrapped(x, y):
+        scores = np.array([statistical_measure(xi, yi) for xi, yi in zip(x, y)])
+        return scores.mean()
+
+    return wrapped
 
 
 def score_of_mean_expression(
     statistical_measure: Callable[[NumericArray, NumericArray], float],
 ) -> Callable[[NumericArray, NumericArray], float]:
-    return lambda x, y: statistical_measure(np.mean(x, axis=0), np.mean(y, axis=0))
+
+    def wrapped(x, y):
+        mean_x = np.mean(x, axis=0)
+        mean_y = np.mean(y, axis=0)
+        return statistical_measure(mean_x, mean_y)
+
+    return wrapped
 
 
 def score_of_ravel(
@@ -353,24 +414,30 @@ def expand_configurations(
 
 
 def run_experiment(
-    predictor: Predictor | n2l.pd.PredictorProtocol,
+    celltype_min_n_cells: int,
+    predictors: Sequence[tuple[str, Predictor | n2l.pd.PredictorProtocol]],
     experiment_configs: Sequence[ExperimentConfig],
 ) -> Generator[ExperimentResult]:
-    for dataset, dataset_configs in groupby(
+    for dataset, dataset_iterable in groupby(
         experiment_configs, key=lambda x: x.dataset
     ):
+        dataset_configs = list(dataset_iterable)
+
         (
-            counts,
+            counts_raw,
             split_annotation,
             celltype_annotation,
             gene_samples,
-        ) = process_dataset(dataset)
+            (modality, prediction_scope),
+        ) = process_dataset(dataset, celltype_min_n_cells)
         celltypes = list(set(celltype_annotation))
-        breakpoint()
-        for preprocessing_transformation, preprocessing_configs in groupby(
+        for preprocessing_transformation, preprocessing_iterable in groupby(
             dataset_configs, key=lambda x: x.preprocessing
         ):
-            counts = apply_transformation_func(preprocessing_transformation[0], counts)
+            preprocessing_configs = list(preprocessing_iterable)
+            counts = apply_transformation_func(
+                preprocessing_transformation[0], counts_raw.copy()
+            )
 
             for celltype in celltypes:
                 celltype_mask = np.array(celltype_annotation) == celltype
@@ -378,50 +445,56 @@ def run_experiment(
                     (np.array(split_annotation) == "train"),
                     (np.array(split_annotation) == "test"),
                 )
-                predictor = predictor.fit(counts[train_mask & celltype_mask])
-                for sample_id, (testing_genes, training_genes) in enumerate(
-                    gene_samples
-                ):
-                    _, counts_pred = predictor.predict(
-                        counts[test_mask & celltype_mask][:, training_genes],
-                        training_genes,
-                    )
-                    for (
-                        scoring_axis,
-                        aggregation_type,
-                        statistical_measure,
-                    ), _ in groupby(
-                        preprocessing_configs,
-                        key=lambda x: (
-                            x.scoring_axis,
-                            x.aggregation_type,
-                            x.statistical_measure,
-                        ),
+                for predictor_name, predictor in predictors:
+                    predictor = predictor.fit(counts[train_mask & celltype_mask])
+
+                    for sample_id, (testing_genes, training_genes) in enumerate(
+                        gene_samples
                     ):
-                        scorer = make_scorer(
-                            scoring_axis, aggregation_type, statistical_measure
+                        _, counts_pred = predictor.predict(
+                            counts[test_mask & celltype_mask][:, training_genes],
+                            training_genes,
                         )
-                        value = scorer(
-                            apply_transformation_func(
-                                preprocessing_transformation[1],
-                                counts[test_mask & celltype_mask][:, testing_genes],
+
+                        for (
+                            scoring_axis,
+                            aggregation_type,
+                            statistical_measure,
+                        ), _ in groupby(
+                            preprocessing_configs,
+                            key=lambda x: (
+                                x.scoring_axis,
+                                x.aggregation_type,
+                                x.statistical_measure,
                             ),
-                            apply_transformation_func(
-                                preprocessing_transformation[1],
-                                counts_pred[:, testing_genes],
-                            ),
-                        )
-                        experiment_result = ExperimentResult(
-                            dataset=dataset,
-                            sample_id=sample_id,
-                            celltype=celltype,
-                            preprocessing_transformation=preprocessing_transformation,
-                            aggregation_type=aggregation_type,
-                            scoring_axis=scoring_axis,
-                            statistical_measure=statistical_measure,
-                            value=value,
-                        )
-                        yield experiment_result
+                        ):
+                            scorer = make_scorer(
+                                scoring_axis, aggregation_type, statistical_measure
+                            )
+                            value = scorer(
+                                apply_transformation_func(
+                                    preprocessing_transformation[1],
+                                    counts[test_mask & celltype_mask][:, testing_genes],
+                                ),
+                                apply_transformation_func(
+                                    preprocessing_transformation[1],
+                                    counts_pred[:, testing_genes],
+                                ),
+                            )
+                            experiment_result = ExperimentResult(
+                                dataset=dataset,
+                                modality=modality,
+                                prediction_scope=prediction_scope,
+                                predictor_name=predictor_name,
+                                sample_id=sample_id,
+                                celltype=celltype,
+                                preprocessing_transformation=preprocessing_transformation,
+                                aggregation_type=aggregation_type,
+                                scoring_axis=scoring_axis,
+                                statistical_measure=statistical_measure,
+                                value=value,
+                            )
+                            yield experiment_result
 
 
 def run_targeted_experiment(
@@ -429,7 +502,14 @@ def run_targeted_experiment(
     grouped_experiment_configs: Mapping[str, list[ExperimentConfig]],
 ) -> Generator[tuple[str, ExperimentResult]]:
     for name, experiment_configs in grouped_experiment_configs.items():
-        for experiment_result in run_experiment(predictor, experiment_configs):
+        for experiment_result in tqdm(
+            run_experiment(
+                0,
+                [("", predictor)],
+                experiment_configs,
+            ),
+            total=len(experiment_configs),
+        ):
             yield name, experiment_result
 
 
@@ -463,53 +543,115 @@ def main():
         n_samples=10,
         seed=0,
     )
-    configurations = {
-        "christian": expand_configurations(
-            datasets=[
-                (
-                    (query_h5ad_data_intestine, reference_h5ad_data_intestine),
-                    spatial_subpanel_config,
-                ),
-            ],
-            preprocessing_transformations=[
-                (TransformationFunction.LOG1P, None),
-                (None, None),
-            ],
-            scoring_configurations=[
-                (
-                    ScoringAxis.CELL,
-                    AggregationType.MEAN_SCORE_OF_EXPRESSION,
-                    StatisticalMeasure.EXPLAINED_VARIANCE_1,
-                ),
-            ],
-        ),
-        "helene": expand_configurations(
-            datasets=[
-                (reference_h5ad_data_intestine, pseudospatial_full_config_500),
-                (reference_h5ad_data_intestine, pseudospatial_full_config_250),
-            ],
-            preprocessing_transformations=[
-                (TransformationFunction.LOG1P, None),
-                (TransformationFunction.LOG1P, TransformationFunction.EXPM1),
-                (None, None),
-            ],
-            scoring_configurations=[
-                (
-                    ScoringAxis.CELL,
-                    AggregationType.SCORE_OF_RAVEL,
-                    StatisticalMeasure.EXPLAINED_VARIANCE_2,
-                ),
-            ],
-        ),
-    }
-    with open("christian_helene_comparison.csv", "w", newline="", buffering=1) as f:
-        csv_writer = csv.DictWriter(f, fieldnames=)
-        for result in run_targeted_experiment(
-            predictor=n2l.pd.TangramPredictor(),
-            grouped_experiment_configs=configurations,
-        ):
-            pass
 
+    fieldnames = [
+        "dataset_name",
+        "modality",
+        "prediction_scope",
+        "predictor_name",
+        "sample_id",
+        "celltype",
+        "preprocessing_transformation",
+        "aggregation_type",
+        "scoring_axis",
+        "statistical_measure",
+        "value",
+    ]
+    logger = logging.getLogger(__name__)
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    )
+    logger.info("Running experiments")
+    experiment_configs = expand_configurations(
+        datasets=[
+            (
+                "intestine_spatial",
+                (query_h5ad_data_intestine, reference_h5ad_data_intestine),
+                spatial_subpanel_config,
+            ),
+            (
+                "intestine_pseudospatial",
+                reference_h5ad_data_intestine,
+                PseudospatialSubpanel(
+                    panel_size=500,
+                    sample_size=20,
+                    n_samples=10,
+                    seed=0,
+                ),
+            ),
+            (
+                "intestine_full_250",
+                reference_h5ad_data_intestine,
+                pseudospatial_full_config_250,
+            ),
+            (
+                "intestine_full_500",
+                reference_h5ad_data_intestine,
+                pseudospatial_full_config_500,
+            ),
+        ],
+        preprocessing_transformations=[
+            (None, None),
+            (TransformationFunction.LOG1P, None),
+            (TransformationFunction.LOG1P, TransformationFunction.EXPM1),
+        ],
+        scoring_configurations=[
+            (scoring_axis, aggregation_type, statistical_measure)
+            for scoring_axis, aggregation_type, statistical_measure in product(
+                [
+                    ScoringAxis.CELL,
+                    ScoringAxis.GENE,
+                ],
+                [
+                    AggregationType.MEAN_SCORE_OF_EXPRESSION,
+                    AggregationType.SCORE_OF_MEAN_EXPRESSION,
+                    AggregationType.SCORE_OF_RAVEL,
+                ],
+                [
+                    StatisticalMeasure.PEARSON,
+                    StatisticalMeasure.EXPLAINED_VARIANCE_1,
+                    StatisticalMeasure.EXPLAINED_VARIANCE_2,
+                    StatisticalMeasure.MSE,
+                ],
+            )
+        ],
+    )
+    with open("benchmarking_full_comparison.csv", "w", newline="", buffering=1) as f:
+        csv_writer = csv.DictWriter(f, fieldnames=fieldnames)
+        csv_writer.writeheader()
+        logger.info(
+            f"Running full benchmark experiment with configs {pprint.pformat(experiment_configs)}"
+        )
+        for result in run_experiment(
+            celltype_min_n_cells=10,
+            predictors=[
+                ("tangram", n2l.pd.TangramPredictor()),
+                ("nmf_3", n2l.pd.NmfPredictor(n_components=3)),
+            ],
+            experiment_configs=experiment_configs,
+        ):
+            logger.info(pprint.pformat(result))
+            csv_writer.writerow(
+                {
+                    "dataset_name": result.dataset[0],
+                    "modality": result.modality,
+                    "prediction_scope": result.prediction_scope,
+                    "predictor_name": result.predictor_name,
+                    "sample_id": result.sample_id,
+                    "celltype": result.celltype,
+                    "preprocessing_transformation": "->".join(
+                        t.name if t is not None else "none"
+                        for t in result.preprocessing_transformation
+                    ),
+                    "aggregation_type": result.aggregation_type.name,
+                    "scoring_axis": result.scoring_axis.name,
+                    "statistical_measure": result.statistical_measure.name,
+                    "value": result.value,
+                }
+            )
+
+    logger.info("Done")
     sys.exit(0)
 
 
