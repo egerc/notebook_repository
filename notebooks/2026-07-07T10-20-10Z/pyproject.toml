@@ -1,0 +1,17 @@
+[project]
+name = "2026-07-07t10-20-10z"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "ipython>=9.10.0",
+    "scoring-benchmark",
+    "typer>=0.26.8",
+]
+
+[tool.uv.sources]
+scoring-benchmark = { workspace = true }
+
+[tool.pyright]
+exclude = ["2026-07-07T10-20-10Z.py",]
