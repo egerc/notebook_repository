@@ -348,6 +348,7 @@ class Result(sqlmodel.SQLModel, table=True):
 
 def _adata_dense_mut(adata: AnnData) -> AnnData:
     assert adata.X is not None, "adata.X is None"
+    adata = adata.copy()
     if issparse(adata.X):
         adata.X = adata.X.toarray()  # type: ignore
     adata.X = adata.X.astype(np.float32)  # type: ignore
