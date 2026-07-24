@@ -3,11 +3,12 @@ import os
 import pprint
 from argparse import ArgumentParser, Namespace
 from collections.abc import Generator, Sequence
+from contextlib import nullcontext
 from enum import Enum
 from functools import partial, reduce
 from itertools import product
 from tempfile import TemporaryDirectory
-from typing import Annotated, Any, Callable, Literal
+from typing import Annotated, Any, Callable, Literal, assert_never
 
 import mlflow
 import mofaflex
@@ -164,6 +165,7 @@ class DatasetConfigSC:
     min_n_cells_per_celltype: PositiveInt
     max_n_pcs: PositiveInt
     max_n_neighbours: PositiveInt
+    remove_constant_features: bool
     n_cells: PositiveInt | None = None
 
 
@@ -355,6 +357,17 @@ def _adata_dense_mut(adata: AnnData) -> AnnData:
     return adata
 
 
+def _remove_constant_genes(
+    adata: AnnData,
+    eps: float = 1e-8,
+) -> AnnData:
+    if (X := adata.X) is None:
+        raise ValueError("adata.X is None")
+    variance = np.nanvar(X, axis=0)  # type: ignore
+    non_constant_mask = variance > eps
+    return adata[:, non_constant_mask].copy()
+
+
 def generate_datasets(
     dataset_configs: Sequence[DatasetConfigSC],
 ) -> Generator[tuple[Dataset, tuple[AnnData, AnnData], DatasetConfigSC], None, None]:
@@ -368,6 +381,15 @@ def generate_datasets(
         query = adata[(train_test_split == "test")]
         reference = adata[(train_test_split == "train")]
         query, reference = _adata_dense_mut(query), _adata_dense_mut(reference)
+        if dataset_config.remove_constant_features:
+            query = _remove_constant_genes(query)
+            reference = _remove_constant_genes(reference)
+
+        shared_features = list(
+            set(query.var_names).intersection(set(reference.var_names))
+        )
+        query, reference = query[:, shared_features], reference[:, shared_features]
+
         celltypes = list(
             set(reference.obs[dataset_config.cluster_key]).intersection(
                 set(query.obs[dataset_config.cluster_key])
@@ -377,7 +399,7 @@ def generate_datasets(
             Dataset(
                 name=dataset_config.name,
                 celltype_names=celltypes,
-                feature_names=list(adata.var_names),
+                feature_names=shared_features,
             ),
             (query, reference),
             dataset_config,
@@ -494,6 +516,11 @@ def generate_models(
 def parse_args() -> Namespace:
     parser = ArgumentParser()
     parser.add_argument("config", type=str, help="Path to the configuration file")
+    parser.add_argument(
+        "--debug",
+        action="store_true",
+        help="Run in debug mode (skips database creation and artifact logging)",
+    )
     return parser.parse_args()
 
 
@@ -501,6 +528,7 @@ def main() -> None:
     args = parse_args()
     with open(args.config, "r") as f:
         experiment_config = ExperimentConfig(**yaml.safe_load(f))
+
     logging.basicConfig(
         level=experiment_config.log_level,
         format="%(asctime)s %(levelname)s %(message)s",
@@ -510,6 +538,7 @@ def main() -> None:
         f"Starting MLflow run using the following configuration:\n {pydantic.RootModel(experiment_config).model_dump_json(indent=2)}"
     )
     rng = np.random.default_rng(experiment_config.seed)
+
     mlflow_config = experiment_config.mlflow_config or MlFlowConfig(
         run_id=None,
         experiment_id=None,
@@ -520,6 +549,7 @@ def main() -> None:
         description=None,
         log_system_metrics=None,
     )
+
     with mlflow.start_run(
         run_id=mlflow_config.run_id,
         experiment_id=mlflow_config.experiment_id,
@@ -531,34 +561,46 @@ def main() -> None:
         log_system_metrics=mlflow_config.log_system_metrics,
     ):
         mlflow.log_params(experiment_config.__dict__)
-        with TemporaryDirectory() as tmpdir:
-            sqlite_file_name = "database.db"
-            sqlite_folder_path = os.path.join(tmpdir, sqlite_file_name)
-            sqlite_url = f"sqlite:///{sqlite_folder_path}"
-            engine = sqlmodel.create_engine(sqlite_url, echo=True)
-            sqlmodel.SQLModel.metadata.create_all(engine)
-            with sqlmodel.Session(engine) as session:
+
+        # Determine whether to use a real temporary directory or a dummy placeholder
+        tmpdir_ctx = TemporaryDirectory() if not args.debug else nullcontext()
+
+        with tmpdir_ctx as tmpdir:
+            session_ctx = nullcontext(None)
+
+            match tmpdir:
+                case str():
+                    sqlite_file_name = "database.db"
+                    sqlite_folder_path = os.path.join(tmpdir, sqlite_file_name)
+                    sqlite_url = f"sqlite:///{sqlite_folder_path}"
+                    engine = sqlmodel.create_engine(sqlite_url, echo=True)
+                    sqlmodel.SQLModel.metadata.create_all(engine)
+                    session_ctx = sqlmodel.Session(engine)
+                case None:
+                    sqlite_folder_path = None
+                    logger.info("DEBUG MODE ACTIVE: Skipping database initialization.")
+                case _:
+                    assert_never(tmpdir)
+
+            with session_ctx as session:
                 models = list(
                     generate_models(predictor_configs=experiment_config.predictors)
                 )
-                for (
-                    dataset,
-                    (query, reference),
-                    dataset_config,
-                ) in generate_datasets(
-                    experiment_config.datasets,
+
+                for dataset, (query, reference), dataset_config in generate_datasets(
+                    experiment_config.datasets
                 ):
                     logger.info(f"Processing dataset {pprint.pformat(dataset_config)}")
+
                     samples = list(
                         generate_samples(
-                            sampling_config=(
-                                experiment_config.sampling_config
-                                or SamplingConfig(n_samples=5, panel_size=500)
-                            ),
+                            sampling_config=experiment_config.sampling_config
+                            or SamplingConfig(n_samples=5, panel_size=500),
                             rng=rng,
                             dataset=dataset,
                         )
                     )
+
                     celltypes = list(
                         generate_celltypes(
                             dataset=dataset,
@@ -567,6 +609,7 @@ def main() -> None:
                             dataset_config=dataset_config,
                         )
                     )
+
                     for model, predictor_config in models:
                         logger.info(
                             f"Fitting model {model.name} on dataset {dataset.name}"
@@ -577,6 +620,7 @@ def main() -> None:
                             if predictor_config.transform == "log"
                             else lambda x: x
                         )
+
                         match predictor_config.scope:
                             case "global":
                                 predictor = predictor.fit(transform(reference.X))  # type: ignore
@@ -593,9 +637,15 @@ def main() -> None:
                                     )
                                     for celltype in celltypes
                                 )
+
                         for (celltype, predictor_protocol), sample in product(
                             my_generator, samples
                         ):
+                            logger.info(
+                                f"Processing celltype {pprint.pformat(celltype)}, ",
+                                f"predictor {pprint.pformat(predictor_protocol)}, ",
+                                f"sample {pprint.pformat((sample))}, ",
+                            )
                             model_embedding_query, model_counts_query = (
                                 predictor_protocol.predict(
                                     x=transform(
@@ -621,6 +671,7 @@ def main() -> None:
                                 if predictor_protocol.feature_embedding is not None
                                 else np.array(np.nan)
                             )
+
                             result = Result(
                                 model_embedding_reference=model_embedding_reference,
                                 model_counts_reference=model_counts_reference,
@@ -631,18 +682,24 @@ def main() -> None:
                                 celltype=celltype,
                                 sample=sample,
                             )
-                            session.add(result)
+
+                            # Only execute database writes if session exists
+                            if session is not None:
+                                session.add(result)
+                                session.commit()
+                                session.expunge(result)
+
                             logger.info(
-                                f"Added result for sample {sample.id_of_sample}, "
-                                f"dataset {dataset.name}, "
-                                f"celltype {celltype.name} and "
-                                f"model {model.name} with scope {model.scope} and transfrom{model.transform}"
+                                f"Processed sample {sample.id_of_sample}, dataset {dataset.name}, "
+                                f"celltype {celltype.name}, model {model.name} "
+                                f"(DB tracking: {not args.debug})"
                             )
-                            session.commit()
-                            session.expunge(result)
-                logger.info("Committing results")
-                session.commit()
-                mlflow.log_artifact(sqlite_folder_path)
+
+                if session is not None and sqlite_folder_path is not None:
+                    logger.info("Committing final results")
+                    session.commit()
+                    mlflow.log_artifact(sqlite_folder_path)
+
     logger.info("Done")
 
 

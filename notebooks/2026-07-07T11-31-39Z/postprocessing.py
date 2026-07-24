@@ -7,7 +7,9 @@ import gseapy
 import mlflow
 import nico2_lib as n2l
 import numpy as np
+import pandas as pd
 import scipy
+from joblib.memory import Memory
 from nico2_lib.typing import NumericArray
 from numpy.typing import NDArray
 from pandas.io.parsers.python_parser import csv
@@ -18,6 +20,8 @@ from sqlmodel import Session, create_engine, select
 from tqdm import tqdm
 
 from experiment import Result
+
+memory = Memory(location="./cache")
 
 
 def identity(x: float) -> float:
@@ -289,7 +293,7 @@ def max_cosine_alignment_scoring(
 GeneProgramsDB = frozenset[tuple[str, frozenset[str]]]
 
 
-@cache
+@memory.cache
 def get_gene_programs_db(
     name: str,
 ) -> GeneProgramsDB:
@@ -310,6 +314,7 @@ def get_gene_program_counts(
     return np.array(binary_matrix)
 
 
+@cache
 def extract_gene_list(gene_programs_db: GeneProgramsDB) -> list[str]:
     return sorted(
         list(
@@ -338,6 +343,36 @@ def compute_factor_gene_correlations(
     ).T
 
 
+def compute_factor_gene_correlations_vectorized(
+    x: NumericArray,
+    w: NumericArray,
+) -> NumericArray:
+    """Fully vectorized Pearson correlation between matrix columns."""
+    # Center the columns (subtract mean)
+    x_centered = x - np.mean(x, axis=0)
+    w_centered = w - np.mean(w, axis=0)
+
+    x_std = np.std(x, axis=0)
+    w_std = np.std(w, axis=0)
+
+    x_std[x_std == 0] = 1e-8
+    w_std[w_std == 0] = 1e-8
+
+    covariance = np.dot(w_centered.T, x_centered)
+    normalization = np.outer(w_std, x_std) * x.shape[0]
+
+    return covariance / normalization
+
+
+def get_hgnc_symbols_ordered(gene_list: list[str], csv_path: str) -> list[str]:
+    gene_set = set(gene_list)
+    cols_to_use = ["ensembl_gene_id", "hgnc_symbol"]
+    df = pd.read_csv(csv_path, usecols=cols_to_use)  # type: ignore
+    filtered_df = df[df["ensembl_gene_id"].isin(gene_set)]
+    mapping = dict(zip(filtered_df["ensembl_gene_id"], filtered_df["hgnc_symbol"]))
+    return [mapping.get(gene, gene) for gene in gene_list]
+
+
 def enrichment_score_evaluator(result: Result) -> tuple[float, float]:
     if result.model_embedding_reference is None or result.model_embedding_query is None:
         return (np.nan, np.nan)
@@ -345,7 +380,13 @@ def enrichment_score_evaluator(result: Result) -> tuple[float, float]:
     enrichment_db_name = "KEGG_2026"
     gene_programs_db = get_gene_programs_db(name=enrichment_db_name)
     database_gene_names = extract_gene_list(gene_programs_db=gene_programs_db)
-    dataset_gene_names = [gene.upper() for gene in result.sample.dataset.feature_names]
+    dataset_gene_names = (
+        get_hgnc_symbols_ordered(sample_feature_names, "hsapiens_gene_ensembl.csv")
+        if (sample_feature_names := result.sample.dataset.feature_names)[0].startswith(
+            "ENSG"
+        )
+        else [gene.upper() for gene in sample_feature_names]
+    )
     genes: list[str] = np.intersect1d(database_gene_names, dataset_gene_names).tolist()
     if not genes:
         print(f"No overlapping genes found for result {result.id}. Returning 0.0.")
@@ -357,10 +398,9 @@ def enrichment_score_evaluator(result: Result) -> tuple[float, float]:
     feature_idx: NDArray[np.intp] = np.where(np.isin(dataset_gene_names, genes))[0]
 
     def abc(x: NumericArray, w: NumericArray) -> float:
-        factor_gene_correlations = compute_factor_gene_correlations(
+        factor_gene_correlations = compute_factor_gene_correlations_vectorized(
             x=x,
             w=w,
-            corr_func=n2l.mt.pearson_metric,  # type: ignore
         )
         factor_gene_correlations = np.nan_to_num(factor_gene_correlations)
         return max_cosine_alignment_scoring(
@@ -446,12 +486,12 @@ METRIC_FNS: dict[
         ],
     ],
 ] = {
-    "embedding_autocorrelation": {
-        "pearsonr": (
-            create_embedding_evaluator(n2l.mt.pearson_metric),  # type: ignore
-            compose(lambda x: x + 1, tent),
-        ),
-    },
+    # "embedding_autocorrelation": {
+    #    "pearsonr": (
+    #        create_embedding_evaluator(n2l.mt.pearson_metric),  # type: ignore
+    #        compose(lambda x: x + 1, tent),
+    #    ),
+    # },
     "embedding_structure": {
         "multivariate_gearys_c": (
             create_embedding_structure_evaluator(compute_multivariate_geary),
@@ -464,19 +504,19 @@ METRIC_FNS: dict[
             identity,
         ),
     },
-    "coverage": {
-        "gini": (
-            create_coverage_sparsity_evaluator(gini),
-            compose(lambda x: x + 1, negative),
-        ),
-        # "entropy": (create_coverage_sparsity_evaluator(entropy), identity),
-    },
-    # "biological_enrichment": {
-    #    "max_cosine_alignment": (
-    #        enrichment_score_evaluator,
-    #        lambda x: np.clip(x, 0, 1),
-    #    )
+    # "coverage": {
+    #    "gini": (
+    #        create_coverage_sparsity_evaluator(gini),
+    #        compose(lambda x: x + 1, negative),
+    #    ),
+    #    # "entropy": (create_coverage_sparsity_evaluator(entropy), identity),
     # },
+    "biological_enrichment": {
+        "max_cosine_alignment": (
+            enrichment_score_evaluator,
+            lambda x: np.clip(x, 0, 1),
+        )
+    },
     "feature_prediction_performance": {
         "mean_squared_error": (
             mean_squared_error_evaluator,
@@ -548,7 +588,13 @@ def main():
             )
             writer.writeheader()
             for result in tqdm(results):
-                logger.info(f"Processing result {result.id}")
+                logger.info(
+                    f"Processing result: {result.id}, "
+                    f"Dataset: {result.celltype.dataset.name}, "
+                    f"Celltype: {result.celltype.name}, "
+                    f"Model: {result.model.name}; with config: {result.model.transform, result.model.scope}, "
+                    f"Sample: {result.sample.id_of_sample}, "
+                )
                 for metric_category, function_mapping in METRIC_FNS.items():
                     for function_name, (
                         metric_function,
