@@ -1,18 +1,29 @@
+from collections.abc import Sequence
 from enum import StrEnum, auto
-from typing import assert_never
+from typing import Literal, assert_never
 
 import anndata as ad
 import numpy as np
+import pandas as pd
+import pandera.pandas as pa
 import scanpy as sc
 from anndata.typing import AnnData  # type: ignore
 from numpy import intp, number
 from numpy.typing import NDArray
-from pandas import DataFrame
+from pandera.typing.pandas import DataFrame
 from pydantic import ConfigDict
 from pydantic.dataclasses import dataclass
-from pydantic.types import FilePath, PositiveInt
+from pydantic.types import FilePath, NonNegativeInt, PositiveInt
 
-from log_2026_07_23t08_09_06z.types import Err, Ok, Result
+from log_2026_07_23t08_09_06z.types import (
+    Err,
+    Just,
+    Maybe,
+    Ok,
+    Result,
+    bind_maybe,
+    unwrap_result,
+)
 
 type NumericArray = NDArray[number]
 type IndexArray = NDArray[intp]
@@ -22,37 +33,111 @@ class GeneOrdering(StrEnum):
     HVG = auto()
 
 
-def rank_genes(adata: AnnData, gene_ordering: GeneOrdering) -> IndexArray:
+def compute_hvgs(adata: AnnData) -> Result[IndexArray, ValueError]:
     match hvg_df := sc.pp.highly_variable_genes(
         adata,
         flavor="seurat_v3",
         inplace=False,
     ):
-        case DataFrame():
-            return hvg_df.sort_values(
-                "variances_norm", ascending=False
-            ).index.to_numpy()
+        case pd.DataFrame():
+            return Ok(
+                hvg_df.sort_values("variances_norm", ascending=False).index.to_numpy()
+            )
         case None:
-            raise ValueError("hvg_df is None")
+            return Err(ValueError("hvg_df is None"))
         case _:
             assert_never(hvg_df)
 
 
+def rank_genes(adata: AnnData, gene_ordering: GeneOrdering) -> IndexArray:
+    match gene_ordering:
+        case GeneOrdering.HVG:
+            return unwrap_result(compute_hvgs(adata))
+        case _:
+            assert_never(gene_ordering)
+
+
+@dataclass(frozen=True, slots=True)
+class SamplePanel:
+    value: PositiveInt
+
+
+@dataclass(frozen=True, slots=True)
+class SampleRemainderPanel:
+    value: PositiveInt
+
+
+type SamplingStrategy = SamplePanel | SampleRemainderPanel
+
+
+class SamplingSchema(pa.DataFrameModel):
+    sample_id: NonNegativeInt
+    split: str = pa.Field(isin=["train", "test"])
+    gene: str
+
+
+def sample_genes(
+    genes: Sequence[str],
+    sampling_strategy: SamplingStrategy,
+    n_samples: PositiveInt,
+    rng: np.random.Generator,
+) -> Result[DataFrame[SamplingSchema], ValueError]:
+    n_total = len(genes)
+    genes_arr = np.asarray(genes)
+    match sampling_strategy:
+        case SamplePanel(n_genes):
+            n_train = n_genes
+        case SampleRemainderPanel(n_genes):
+            n_train = n_total - n_genes
+        case _:
+            assert_never(sampling_strategy)
+    if not (0 <= n_train <= n_total):
+        return Err(
+            ValueError(
+                f"Invalid n_genes ({sampling_strategy.value}) for total genes count ({n_total})."
+            )
+        )
+    n_test = n_total - n_train
+    tiled_genes = np.tile(genes_arr, (n_samples, 1))
+    shuffled_genes = rng.permuted(tiled_genes, axis=1)
+    train_genes = shuffled_genes[:, :n_train]
+    test_genes = shuffled_genes[:, n_train:]
+    sample_ids = np.arange(n_samples)
+    train_sample_ids = np.repeat(sample_ids, n_train)
+    test_sample_ids = np.repeat(sample_ids, n_test)
+    df = DataFrame[SamplingSchema](
+        {
+            "sample_id": np.concatenate([train_sample_ids, test_sample_ids]),
+            "split": np.repeat(
+                ["train", "test"], [n_samples * n_train, n_samples * n_test]
+            ),
+            "gene": np.concatenate([train_genes.ravel(), test_genes.ravel()]),
+        }
+    )
+
+    return Ok(df)  # type: ignore
+
+
 @dataclass(frozen=True, slots=True)
 class SpatialSetup:
-    sample_size: PositiveInt
+    pass
+
+
+@dataclass(frozen=True, slots=True)
+class SpatialPseudospatialSetup:
+    seed: int
 
 
 @dataclass(frozen=True, slots=True)
 class PseudospatialSetup:
     panel_size: PositiveInt
-    sample_size: PositiveInt
     panel_ordering: GeneOrdering
+    seed: int
 
 
 @dataclass(frozen=True, slots=True)
 class NonSpatialSetup:
-    panel_size: PositiveInt
+    seed: int
 
 
 @dataclass(frozen=True, slots=True)
@@ -65,6 +150,12 @@ class SingleCellData:
 class QueryPlusReference:
     query: SingleCellData
     reference: SingleCellData
+
+
+class AnnotationSchema(pa.DataFrameModel):
+    barcode: str
+    split: Literal["train", "test"]
+    annotation: str
 
 
 def validate_single_cell_data(
@@ -87,6 +178,20 @@ type DatasetSetup = (
     | tuple[PseudospatialSetup, SingleCellData | QueryPlusReference]
     | tuple[NonSpatialSetup, SingleCellData | QueryPlusReference]
 )
+
+
+def _(dataset_setup: DatasetSetup) -> tuple[DataFrame[AnnotationSchema], Sequence[str]]:
+    match dataset_setup:
+        case SpatialSetup(), QueryPlusReference():
+            ...
+        case PseudospatialSetup(), SingleCellData() | QueryPlusReference():
+            ...
+        case NonSpatialSetup(seed), SingleCellData(
+            adata_path, cluster_key
+        ) | QueryPlusReference(_, _, adata_path, cluster_key):
+            ...
+        case _:
+            assert_never(dataset_setup)
 
 
 @dataclass(frozen=True, config=ConfigDict(arbitrary_types_allowed=True))
