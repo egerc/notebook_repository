@@ -19,18 +19,37 @@ from log_2026_07_23t08_09_06z.types import (
     Err,
     Just,
     Maybe,
+    Null,
     Ok,
     Result,
     bind_maybe,
+    bind_result,
     unwrap_result,
+)
+from log_2026_07_23t08_09_06z.utils import (
+    read_h5ad,
+    slice_adata_obs,
+    validate_pandas_pandera,
+)
+    read_h5ad,
+    slice_adata_obs,
+    validate_pandas_pandera,
 )
 
 type NumericArray = NDArray[number]
 type IndexArray = NDArray[intp]
 
 
-class GeneOrdering(StrEnum):
-    HVG = auto()
+class HighlyVariableGenes:
+    pass
+
+
+@dataclass(frozen=True)
+class Random:
+    seed: int
+
+
+type GeneOrderingConfig = HighlyVariableGenes | Random
 
 
 def compute_hvgs(adata: AnnData) -> Result[IndexArray, ValueError]:
@@ -49,10 +68,14 @@ def compute_hvgs(adata: AnnData) -> Result[IndexArray, ValueError]:
             assert_never(hvg_df)
 
 
-def rank_genes(adata: AnnData, gene_ordering: GeneOrdering) -> IndexArray:
+def rank_genes(adata: AnnData, gene_ordering: GeneOrderingConfig) -> IndexArray:
     match gene_ordering:
-        case GeneOrdering.HVG:
+        case HighlyVariableGenes():
             return unwrap_result(compute_hvgs(adata))
+        case Random(seed):
+            return np.random.default_rng(seed).choice(
+                adata.var_names, size=len(adata.var_names), replace=False
+            )
         case _:
             assert_never(gene_ordering)
 
@@ -76,12 +99,12 @@ class SamplingSchema(pa.DataFrameModel):
     gene: str
 
 
-def sample_genes(
+def _sample_genes(
     genes: Sequence[str],
     sampling_strategy: SamplingStrategy,
     n_samples: PositiveInt,
     rng: np.random.Generator,
-) -> Result[DataFrame[SamplingSchema], ValueError]:
+) -> Result[pd.DataFrame, ValueError]:
     n_total = len(genes)
     genes_arr = np.asarray(genes)
     match sampling_strategy:
@@ -105,7 +128,7 @@ def sample_genes(
     sample_ids = np.arange(n_samples)
     train_sample_ids = np.repeat(sample_ids, n_train)
     test_sample_ids = np.repeat(sample_ids, n_test)
-    df = DataFrame[SamplingSchema](
+    df = pd.DataFrame(
         {
             "sample_id": np.concatenate([train_sample_ids, test_sample_ids]),
             "split": np.repeat(
@@ -115,7 +138,21 @@ def sample_genes(
         }
     )
 
-    return Ok(df)  # type: ignore
+    return Ok(df)
+
+
+def sample_genes(
+    genes: Sequence[str],
+    sampling_strategy: SamplingStrategy,
+    n_samples: PositiveInt,
+    rng: np.random.Generator,
+) -> DataFrame[SamplingSchema]:
+    return unwrap_result(
+        bind_result(
+            _sample_genes(genes, sampling_strategy, n_samples, rng),
+            lambda df: validate_pandas_pandera(SamplingSchema, df),
+        )
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -131,7 +168,7 @@ class SpatialPseudospatialSetup:
 @dataclass(frozen=True, slots=True)
 class PseudospatialSetup:
     panel_size: PositiveInt
-    panel_ordering: GeneOrdering
+    panel_ordering: GeneOrderingConfig
     seed: int
 
 
@@ -175,23 +212,74 @@ def validate_single_cell_data(
 
 type DatasetSetup = (
     tuple[SpatialSetup, QueryPlusReference]
+    | tuple[SpatialPseudospatialSetup, QueryPlusReference]
     | tuple[PseudospatialSetup, SingleCellData | QueryPlusReference]
     | tuple[NonSpatialSetup, SingleCellData | QueryPlusReference]
 )
 
 
-def _(dataset_setup: DatasetSetup) -> tuple[DataFrame[AnnotationSchema], Sequence[str]]:
+def _(dataset_setup: DatasetSetup) -> tuple[DataFrame[AnnotationSchema], list[str]]:
+    annotation: DataFrame[AnnotationSchema]
+    genes: list[str]
     match dataset_setup:
-        case SpatialSetup(), QueryPlusReference():
-            ...
-        case PseudospatialSetup(), SingleCellData() | QueryPlusReference():
+        case SpatialSetup(), QueryPlusReference(
+            SingleCellData(query_path, query_cluster_key),
+            SingleCellData(reference_path, reference_cluster_key),
+        ):
+            reference_adata = ad.read_h5ad(reference_path)
+            reference_adata.obs["annotation"] = reference_adata.obs[
+                reference_cluster_key
+            ]
+            query_adata = ad.read_h5ad(query_path)
+            query_adata.obs["annotation"] = query_adata.obs[query_cluster_key]
+            celltypes: set[str] = set(reference_adata.obs["annotation"].values) & set(
+                query_adata.obs["annotation"].values
+            )
+            reference_adata = reference_adata[
+                reference_adata.obs["annotation"].isin(list(celltypes))
+            ]
+            query_adata = query_adata[
+                query_adata.obs["annotation"].isin(list(celltypes))
+            ]
+
+            adata = ad.concat(
+                {
+                    "train": reference_adata,
+                    "test": query_adata,
+                },
+                label="split",
+            )
+        case SpatialPseudospatialSetup(seed), QueryPlusReference(
+            SingleCellData(query_path, query_cluster_key),
+            SingleCellData(reference_path, reference_cluster_key),
+        ):
+            adata = ad.read_h5ad(reference_path)
+            adata.obs["annotation"] = adata.obs[reference_cluster_key]
+            query_adata = ad.read_h5ad(query_path, backed="r")
+            query_adata.obs["annotation"] = query_adata.obs[query_cluster_key]
+            celltypes: set[str] = set(adata.obs["annotation"].values) & set(
+                query_adata.obs["annotation"].values
+            )
+            adata = adata[adata.obs["annotation"].isin(list(celltypes))]
+
+            adata.obs["split"] = np.random.default_rng(seed).choice(
+                ["train", "test"], size=len(adata), p=[0.8, 0.2]
+            )
+        case PseudospatialSetup(
+            panel_size, panel_ordering, seed
+        ), SingleCellData(adata_path, cluster_key) | QueryPlusReference(_, SingleCellData(adata_path, cluster_key)):
             ...
         case NonSpatialSetup(seed), SingleCellData(
             adata_path, cluster_key
-        ) | QueryPlusReference(_, _, adata_path, cluster_key):
+        ) | QueryPlusReference(_, SingleCellData(adata_path, cluster_key)):
             ...
         case _:
             assert_never(dataset_setup)
+
+    annotation = unwrap_result(bind_result(bind_result(slice_adata_obs(adata, ["index", "annotation", "split"]), lambda df: Ok(df.rename(columns={"index": "barcode"}))), lambda df: validate_pandas_pandera(AnnotationSchema, df)),)
+
+    genes: list[str] = adata.var_names.str.tolist(a)
+    return annotation, genes
 
 
 @dataclass(frozen=True, config=ConfigDict(arbitrary_types_allowed=True))

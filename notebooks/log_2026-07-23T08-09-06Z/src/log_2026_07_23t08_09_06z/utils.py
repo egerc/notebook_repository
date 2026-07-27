@@ -2,6 +2,7 @@ from collections.abc import Sequence
 from typing import Literal
 
 import anndata as ad
+import pandas as pd
 import pandera.pandas as pa
 from anndata.typing import AnnData  # type: ignore
 from pandera.typing.pandas import DataFrame
@@ -29,4 +30,25 @@ def read_h5ad(
             )
         )
     except Exception as e:
+        return Err(e)
+
+
+def validate_pandas_pandera[S: pa.DataFrameModel](
+    schema: type[S],
+    df: pd.DataFrame,
+    lazy: bool = True,
+) -> Result[DataFrame[S], pa.errors.SchemaErrors | pa.errors.SchemaError]:
+    try:
+        validated_df = schema.validate(df, lazy=lazy)
+        return Ok(validated_df)
+    except (pa.errors.SchemaError, pa.errors.SchemaErrors) as e:
+        return Err(e)
+
+
+def slice_adata_obs(
+    adata: AnnData, columns: list[str | Literal["index"]]
+) -> Result[pd.DataFrame, KeyError]:
+    try:
+        return adata.obs[columns].copy()  # type: ignore
+    except KeyError as e:
         return Err(e)
