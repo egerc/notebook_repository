@@ -1,5 +1,4 @@
-from collections.abc import Sequence
-from enum import StrEnum, auto
+from collections.abc import Generator, Sequence
 from typing import Literal, assert_never
 
 import anndata as ad
@@ -11,26 +10,20 @@ from anndata.typing import AnnData  # type: ignore
 from numpy import intp, number
 from numpy.typing import NDArray
 from pandera.typing.pandas import DataFrame
-from pydantic import ConfigDict
 from pydantic.dataclasses import dataclass
 from pydantic.types import FilePath, NonNegativeInt, PositiveInt
 
 from log_2026_07_23t08_09_06z.types import (
     Err,
-    Just,
-    Maybe,
-    Null,
     Ok,
     Result,
-    bind_maybe,
     bind_result,
+    ok_or,
+    unwrap_maybe,
     unwrap_result,
 )
 from log_2026_07_23t08_09_06z.utils import (
-    read_h5ad,
-    slice_adata_obs,
-    validate_pandas_pandera,
-)
+    get_dense_counts,
     read_h5ad,
     slice_adata_obs,
     validate_pandas_pandera,
@@ -40,11 +33,12 @@ type NumericArray = NDArray[number]
 type IndexArray = NDArray[intp]
 
 
+@dataclass(frozen=True, slots=True)
 class HighlyVariableGenes:
     pass
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class Random:
     seed: int
 
@@ -93,7 +87,7 @@ class SampleRemainderPanel:
 type SamplingStrategy = SamplePanel | SampleRemainderPanel
 
 
-class SamplingSchema(pa.DataFrameModel):
+class GeneAnnotationSchema(pa.DataFrameModel):
     sample_id: NonNegativeInt
     split: str = pa.Field(isin=["train", "test"])
     gene: str
@@ -146,12 +140,10 @@ def sample_genes(
     sampling_strategy: SamplingStrategy,
     n_samples: PositiveInt,
     rng: np.random.Generator,
-) -> DataFrame[SamplingSchema]:
-    return unwrap_result(
-        bind_result(
-            _sample_genes(genes, sampling_strategy, n_samples, rng),
-            lambda df: validate_pandas_pandera(SamplingSchema, df),
-        )
+) -> Result[DataFrame[GeneAnnotationSchema], Exception]:
+    return bind_result(
+        _sample_genes(genes, sampling_strategy, n_samples, rng),
+        lambda df: validate_pandas_pandera(GeneAnnotationSchema, df),
     )
 
 
@@ -189,9 +181,9 @@ class QueryPlusReference:
     reference: SingleCellData
 
 
-class AnnotationSchema(pa.DataFrameModel):
+class CellAnnotationSchema(pa.DataFrameModel):
     barcode: str
-    split: Literal["train", "test"]
+    split: str = pa.Field(isin=["train", "test"])
     annotation: str
 
 
@@ -218,9 +210,9 @@ type DatasetSetup = (
 )
 
 
-def _(dataset_setup: DatasetSetup) -> tuple[DataFrame[AnnotationSchema], list[str]]:
-    annotation: DataFrame[AnnotationSchema]
-    genes: list[str]
+def split_cells(
+    dataset_setup: DatasetSetup,
+) -> tuple[Result[DataFrame[CellAnnotationSchema], Exception], list[str]]:
     match dataset_setup:
         case SpatialSetup(), QueryPlusReference(
             SingleCellData(query_path, query_cluster_key),
@@ -260,113 +252,105 @@ def _(dataset_setup: DatasetSetup) -> tuple[DataFrame[AnnotationSchema], list[st
             celltypes: set[str] = set(adata.obs["annotation"].values) & set(
                 query_adata.obs["annotation"].values
             )
-            adata = adata[adata.obs["annotation"].isin(list(celltypes))]
+            adata = adata[adata.obs["annotation"].isin(list(celltypes))].copy()
 
             adata.obs["split"] = np.random.default_rng(seed).choice(
                 ["train", "test"], size=len(adata), p=[0.8, 0.2]
             )
-        case PseudospatialSetup(
-            panel_size, panel_ordering, seed
-        ), SingleCellData(adata_path, cluster_key) | QueryPlusReference(_, SingleCellData(adata_path, cluster_key)):
-            ...
+        case PseudospatialSetup(panel_size, panel_ordering, seed), SingleCellData(
+            adata_path, cluster_key
+        ) | QueryPlusReference(_, SingleCellData(adata_path, cluster_key)):
+            adata = ad.read_h5ad(adata_path)
+            adata = adata[:, rank_genes(adata, panel_ordering)[:panel_size]].copy()
+            adata.obs["annotation"] = adata.obs[cluster_key].values
+            adata.obs["split"] = np.random.default_rng(seed).choice(
+                ["train", "test"], size=len(adata), p=[0.8, 0.2]
+            )
+            celltypes: set[str] = set(adata.obs["annotation"].values)
         case NonSpatialSetup(seed), SingleCellData(
             adata_path, cluster_key
         ) | QueryPlusReference(_, SingleCellData(adata_path, cluster_key)):
-            ...
+            adata = ad.read_h5ad(adata_path)
+            adata.obs["annotation"] = adata.obs[cluster_key].values
+            celltypes: set[str] = set(adata.obs["annotation"].values)
+            adata.obs["split"] = np.random.default_rng(seed).choice(
+                ["train", "test"], size=len(adata), p=[0.8, 0.2]
+            )
         case _:
             assert_never(dataset_setup)
 
-    annotation = unwrap_result(bind_result(bind_result(slice_adata_obs(adata, ["index", "annotation", "split"]), lambda df: Ok(df.rename(columns={"index": "barcode"}))), lambda df: validate_pandas_pandera(AnnotationSchema, df)),)
-
-    genes: list[str] = adata.var_names.str.tolist(a)
-    return annotation, genes
-
-
-@dataclass(frozen=True, config=ConfigDict(arbitrary_types_allowed=True))
-class ProcessedData:
-    dataset_setup: DatasetSetup
-    counts: NumericArray
-    training_cells_index: IndexArray
-    testing_cells_index: IndexArray
-    celltypes: set[str]
-    annotation: list[str]
-
-
-def sample_data(
-    dataset_setup: DatasetSetup,
-    rng: np.random.Generator,
-) -> ProcessedData:
-    match dataset_setup:
-        case SpatialSetup(), QueryPlusReference(
-            SingleCellData(query_path, query_cluster_key),
-            SingleCellData(reference_path, reference_cluster_key),
-        ):
-            reference_adata = ad.read_h5ad(reference_path)
-            reference_adata.obs["annotation"] = reference_adata.obs[
-                reference_cluster_key
-            ]
-            query_adata = ad.read_h5ad(query_path)
-            query_adata.obs["annotation"] = query_adata.obs[query_cluster_key]
-            celltypes: set[str] = set(reference_adata.obs["annotation"].values) & set(
-                query_adata.obs["annotation"].values
-            )
-            reference_adata = reference_adata[
-                reference_adata.obs["annotation"].isin(list(celltypes))
-            ]
-            query_adata = query_adata[
-                query_adata.obs["annotation"].isin(list(celltypes))
-            ]
-
-            adata = ad.concat(
-                {
-                    "train": reference_adata,
-                    "test": query_adata,
-                },
-                label="split",
-            )
-            training_cells_index, testing_cells_index = (
-                np.where((mask := adata.obs["split"].values) == "train")[0],  # type: ignore
-                np.where(mask == "test")[0],  # type: ignore
-            )
-            annotation = adata.obs["annotation"].values.tolist()
-
-        case PseudospatialSetup(panel_size, _, panel_ordering), SingleCellData(
-            path, cluster_key
-        ) | QueryPlusReference(_, SingleCellData(path, cluster_key)):
-            adata = ad.read_h5ad(path)
-            adata = adata[:, rank_genes(adata, panel_ordering)[:panel_size]]
-            adata.obs["annotation"] = adata.obs[cluster_key].values
-            mask = rng.choice(["train", "test"], adata.n_obs, p=[0.8, 0.2])
-            training_cells_index, testing_cells_index = (
-                np.where(mask == "train")[0],
-                np.where(mask == "test")[0],
-            )
-            celltypes = set(adata[training_cells_index].obs["annotation"].values) & set(
-                adata[testing_cells_index].obs["annotation"].values
-            )
-            adata = adata[adata.obs["annotation"].isin(list(celltypes))]
-            annotation: list[str] = adata.obs["annotation"].values.tolist()
-        case NonSpatialSetup(_), SingleCellData(path, cluster_key) | QueryPlusReference(
-            _, SingleCellData(path, cluster_key)
-        ):
-            adata = ad.read_h5ad(path)
-            adata.obs["annotation"] = adata.obs[cluster_key].values
-            mask = rng.choice(["train", "test"], adata.n_obs, p=[0.8, 0.2])
-            training_cells_index, testing_cells_index = (
-                np.where(mask == "train")[0],
-                np.where(mask == "test")[0],
-            )
-            annotation: list[str] = adata.obs["annotation"].values.tolist()
-            celltypes = set(annotation)
-
-        case _:
-            assert_never(dataset_setup)
-    counts: NumericArray = adata.X  # type: ignore
-    return ProcessedData(
-        dataset_setup=dataset_setup,
-        counts=counts,
-        training_cells_index=training_cells_index,
-        testing_cells_index=testing_cells_index,
-        celltypes=celltypes,
-        annotation=annotation,
+    annotation_result = bind_result(
+        bind_result(
+            bind_result(
+                slice_adata_obs(adata, ["index", "annotation", "split"]),
+                lambda df: Ok(df.rename(columns={"index": "barcode"})),
+            ),
+            lambda df: Ok(
+                df.assign(
+                    annotation=df["annotation"].astype(str),
+                    split=df["split"].astype(str),
+                )
+            ),
+        ),
+        lambda df: validate_pandas_pandera(CellAnnotationSchema, df),
     )
+
+    genes: list[str] = adata.var_names.tolist()
+    return annotation_result, genes
+
+
+def get_dataset_counts(
+    single_cell_data: SingleCellData,
+    cell_barcodes: Sequence[str],
+    gene_ids: Sequence[str],
+) -> Result[NumericArray, Exception | ValueError]:
+    def get_counts(adata: AnnData) -> Result[NumericArray, ValueError]:
+        if ~np.isin(gene_ids, adata.var_names):
+            return Err(ValueError("gene_ids not found in adata"))
+        elif ~np.isin(cell_barcodes, adata.obs_names):
+            return Err(ValueError("cell_barcodes not found in adata"))
+        else:
+            return ok_or(
+                get_dense_counts(adata[cell_barcodes, gene_ids]),
+                ValueError("Counts empty"),
+            )
+
+    match single_cell_data:
+        case SingleCellData(adata_path):
+            counts_result = bind_result(
+                read_h5ad(adata_path, backed="r"),
+                get_counts,
+            )
+        case _:
+            assert_never(single_cell_data)
+    return counts_result
+
+
+def resolve_single_cell_object(
+    dataset_setup: SingleCellData | QueryPlusReference, split: Literal["train", "test"]
+) -> SingleCellData:
+    match dataset_setup, split:
+        case SingleCellData(), _:
+            return dataset_setup
+        case QueryPlusReference(), "train":
+            return dataset_setup.reference
+        case QueryPlusReference(), "test":
+            return dataset_setup.query
+        case _:
+            assert_never(dataset_setup)
+
+
+def retrieve_counts(
+    dataset_setup: DatasetSetup,
+    cell_annotation: DataFrame[CellAnnotationSchema],
+    gene_annotation: DataFrame[GeneAnnotationSchema],
+) -> Generator[NumericArray]:
+    raise NotImplementedError()
+    dataset_format, dataset = dataset_setup
+    match (dataset_format, dataset):
+        case SpatialSetup(), QueryPlusReference(SingleCellData(), SingleCellData()):
+            pass
+        case SpatialSetup(), QueryPlusReference(SingleCellData(), SingleCellData()):
+            pass
+        case _:
+            assert_never(dataset_setup)

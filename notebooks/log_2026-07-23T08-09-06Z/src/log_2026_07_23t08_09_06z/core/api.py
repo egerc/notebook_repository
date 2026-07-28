@@ -2,7 +2,7 @@ from collections.abc import Sequence
 
 import numpy as np
 
-from log_2026_07_23t08_09_06z.datasets import DatasetSetup, sample_data
+from log_2026_07_23t08_09_06z.datasets import DatasetSetup
 
 
 def preprocess(

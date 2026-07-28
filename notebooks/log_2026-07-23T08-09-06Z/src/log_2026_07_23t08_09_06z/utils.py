@@ -1,15 +1,17 @@
 from collections.abc import Sequence
-from typing import Literal
+from typing import Literal, assert_never
 
 import anndata as ad
+import numpy as np
 import pandas as pd
 import pandera.pandas as pa
-from anndata.typing import AnnData  # type: ignore
+from anndata.typing import AnnData
 from pandera.typing.pandas import DataFrame
 from pydantic.types import FilePath, PositiveInt
-from scipy.sparse import csc_matrix, csr_matrix
+from scipy.sparse import csc_array, csc_matrix, csr_array, csr_matrix
 
-from log_2026_07_23t08_09_06z.types import Err, Ok, Result
+from log_2026_07_23t08_09_06z.datasets import NumericArray
+from log_2026_07_23t08_09_06z.types import Err, Just, Maybe, Nothing, Ok, Result
 
 
 def read_h5ad(
@@ -33,15 +35,27 @@ def read_h5ad(
         return Err(e)
 
 
+def get_dense_counts(adata: AnnData) -> Maybe[NumericArray]:
+    match counts := adata.X:
+        case np.ndarray():
+            return Just(counts)
+        case csr_matrix() | csc_matrix() | csr_array() | csc_array():
+            return Just(counts.toarray())
+        case None:
+            return Nothing()
+        case _:
+            return Nothing()
+
+
 def validate_pandas_pandera[S: pa.DataFrameModel](
     schema: type[S],
     df: pd.DataFrame,
     lazy: bool = True,
-) -> Result[DataFrame[S], pa.errors.SchemaErrors | pa.errors.SchemaError]:
+) -> Result[DataFrame[S], Exception]:
     try:
         validated_df = schema.validate(df, lazy=lazy)
         return Ok(validated_df)
-    except (pa.errors.SchemaError, pa.errors.SchemaErrors) as e:
+    except Exception as e:
         return Err(e)
 
 
@@ -49,6 +63,13 @@ def slice_adata_obs(
     adata: AnnData, columns: list[str | Literal["index"]]
 ) -> Result[pd.DataFrame, KeyError]:
     try:
-        return adata.obs[columns].copy()  # type: ignore
+        match df := adata.obs.reset_index()[columns].copy():
+            case pd.DataFrame():
+                return Ok(df)
+            case pd.Series():
+                return Ok(df.to_frame())
+            case _:
+                assert_never(df)
+
     except KeyError as e:
         return Err(e)

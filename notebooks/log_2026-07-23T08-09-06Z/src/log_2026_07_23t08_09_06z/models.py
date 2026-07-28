@@ -1,14 +1,13 @@
 from enum import StrEnum, auto
 
 import anndata as ad
-import pandera.pandas as pa
 from nico2_lib.predictors import NmfPredictor, ScviPredictor
 from pandera.typing.pandas import DataFrame
 
 from log_2026_07_23t08_09_06z.datasets import (
-    AnnotationSchema,
+    CellAnnotationSchema,
+    GeneAnnotationSchema,
     QueryPlusReference,
-    SamplingSchema,
     SingleCellData,
 )
 from log_2026_07_23t08_09_06z.types import unwrap_result
@@ -23,22 +22,20 @@ class FittingScope(StrEnum):
 type Model = NmfPredictor | ScviPredictor
 
 
-
-
 def generate_results(
     model: Model,
-    annotation_df: DataFrame[AnnotationSchema],
+    annotation_df: DataFrame[CellAnnotationSchema],
     dataset: SingleCellData | QueryPlusReference,
-    sample_df: DataFrame[SamplingSchema],
+    sample_df: DataFrame[GeneAnnotationSchema],
 ) -> None:
     match dataset:
         case SingleCellData(adata_path, _):
-            adata = unwrap_result(read_h5ad(adata_path))
+            _ = unwrap_result(read_h5ad(adata_path))
 
         case QueryPlusReference(
             SingleCellData(query_path, _), SingleCellData(reference_path, _)
         ):
-            adata = ad.concat(
+            _ = ad.concat(
                 [
                     unwrap_result(read_h5ad(query_path)),
                     unwrap_result(read_h5ad(reference_path)),
