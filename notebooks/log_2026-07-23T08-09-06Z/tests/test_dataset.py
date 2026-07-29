@@ -4,7 +4,6 @@ from typing import assert_never
 
 import numpy as np
 import pytest
-from dotenv import load_dotenv
 from pandera.typing.pandas import DataFrame
 from pydantic.types import PositiveInt
 
@@ -28,8 +27,6 @@ from log_2026_07_23t08_09_06z.datasets import (
 )
 from log_2026_07_23t08_09_06z.types import Result, unwrap_result
 from log_2026_07_23t08_09_06z.utils import validate_pandas_pandera
-
-load_dotenv()
 
 query_plus_reference = QueryPlusReference(
     unwrap_result(
@@ -134,5 +131,5 @@ def test_dataloading(
         ]
     ],
 ) -> None:
-    for dataset_setup, cell_annotation_df, gene_annotation_df in []:
+    for _, _, _ in []:
         pass

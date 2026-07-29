@@ -7,19 +7,18 @@ import pandas as pd
 import pandera.pandas as pa
 import scanpy as sc
 from anndata.typing import AnnData  # type: ignore
-from numpy import intp, number
-from numpy.typing import NDArray
 from pandera.typing.pandas import DataFrame
 from pydantic.dataclasses import dataclass
 from pydantic.types import FilePath, NonNegativeInt, PositiveInt
 
 from log_2026_07_23t08_09_06z.types import (
     Err,
+    IndexArray,
+    NumericArray,
     Ok,
     Result,
     bind_result,
     ok_or,
-    unwrap_maybe,
     unwrap_result,
 )
 from log_2026_07_23t08_09_06z.utils import (
@@ -29,17 +28,20 @@ from log_2026_07_23t08_09_06z.utils import (
     validate_pandas_pandera,
 )
 
-type NumericArray = NDArray[number]
-type IndexArray = NDArray[intp]
-
 
 @dataclass(frozen=True, slots=True)
 class HighlyVariableGenes:
-    pass
+    """Select genes by highly-variable ranking."""
 
 
 @dataclass(frozen=True, slots=True)
 class Random:
+    """Select genes in a random order.
+
+    Attributes:
+        seed: Random seed used to shuffle gene names.
+    """
+
     seed: int
 
 
@@ -47,6 +49,16 @@ type GeneOrderingConfig = HighlyVariableGenes | Random
 
 
 def compute_hvgs(adata: AnnData) -> Result[IndexArray, ValueError]:
+    """Compute highly variable genes using the Seurat v3 method.
+
+    Genes are returned sorted by ``variances_norm`` in descending order.
+
+    Args:
+        adata: Input AnnData object.
+
+    Returns:
+        ``Result[IndexArray, ValueError]``.
+    """
     match hvg_df := sc.pp.highly_variable_genes(
         adata,
         flavor="seurat_v3",
@@ -63,6 +75,19 @@ def compute_hvgs(adata: AnnData) -> Result[IndexArray, ValueError]:
 
 
 def rank_genes(adata: AnnData, gene_ordering: GeneOrderingConfig) -> IndexArray:
+    """Rank genes of ``adata`` according to ``gene_ordering``.
+
+    Args:
+        adata: Input AnnData object.
+        gene_ordering: Strategy used to determine gene order.
+
+    Returns:
+        Array of gene indices in the chosen order.
+
+    Raises:
+        ValueError: If ``gene_ordering`` is ``HighlyVariableGenes`` and the
+            HVG computation fails.
+    """
     match gene_ordering:
         case HighlyVariableGenes():
             return unwrap_result(compute_hvgs(adata))
@@ -76,11 +101,23 @@ def rank_genes(adata: AnnData, gene_ordering: GeneOrderingConfig) -> IndexArray:
 
 @dataclass(frozen=True, slots=True)
 class SamplePanel:
+    """Use a fixed-size panel of genes per sample.
+
+    Attributes:
+        value: Number of genes in each panel.
+    """
+
     value: PositiveInt
 
 
 @dataclass(frozen=True, slots=True)
 class SampleRemainderPanel:
+    """Use a panel consisting of all genes except a fixed-size remainder.
+
+    Attributes:
+        value: Number of genes excluded from each panel.
+    """
+
     value: PositiveInt
 
 
@@ -88,9 +125,30 @@ type SamplingStrategy = SamplePanel | SampleRemainderPanel
 
 
 class GeneAnnotationSchema(pa.DataFrameModel):
+    """Pandera schema for gene annotation rows."""
+
     sample_id: NonNegativeInt
     split: str = pa.Field(isin=["train", "test"])
     gene: str
+
+
+def get_gene_ids_by_sample(
+    gene_annotation_df: DataFrame[GeneAnnotationSchema],
+) -> dict[int, dict[Literal["train", "test"], list[str]]]:
+    """Group gene annotations by sample and split.
+
+    Args:
+        gene_annotation_df: Per-sample gene panel annotations.
+
+    Returns:
+        Mapping ``sample_id -> {split: [gene, ...]}``.
+    """
+    return (
+        gene_annotation_df.groupby(["sample_id", "split"])["gene"]
+        .apply(list)
+        .unstack(fill_value=[])  # type: ignore
+        .to_dict(orient="index")  # type: ignore
+    )
 
 
 def _sample_genes(
@@ -99,6 +157,20 @@ def _sample_genes(
     n_samples: PositiveInt,
     rng: np.random.Generator,
 ) -> Result[pd.DataFrame, ValueError]:
+    """Sample train/test gene panels for each sample.
+
+    For each sample, a permutation of ``genes`` is generated and split into a
+    train portion and a test portion according to ``sampling_strategy``.
+
+    Args:
+        genes: Pool of gene names to sample from.
+        sampling_strategy: Determines how the train/test split is sized.
+        n_samples: Number of samples to generate.
+        rng: NumPy random generator used for shuffling.
+
+    Returns:
+        ``Result[pd.DataFrame, ValueError]``.
+    """
     n_total = len(genes)
     genes_arr = np.asarray(genes)
     match sampling_strategy:
@@ -141,6 +213,17 @@ def sample_genes(
     n_samples: PositiveInt,
     rng: np.random.Generator,
 ) -> Result[DataFrame[GeneAnnotationSchema], Exception]:
+    """Sample gene panels and validate the result against ``GeneAnnotationSchema``.
+
+    Args:
+        genes: Pool of gene names to sample from.
+        sampling_strategy: Determines how the train/test split is sized.
+        n_samples: Number of samples to generate.
+        rng: NumPy random generator used for shuffling.
+
+    Returns:
+        ``Result[DataFrame[GeneAnnotationSchema], Exception]``.
+    """
     return bind_result(
         _sample_genes(genes, sampling_strategy, n_samples, rng),
         lambda df: validate_pandas_pandera(GeneAnnotationSchema, df),
@@ -149,16 +232,30 @@ def sample_genes(
 
 @dataclass(frozen=True, slots=True)
 class SpatialSetup:
-    pass
+    """Setup configuration for a spatial transcriptomics dataset."""
 
 
 @dataclass(frozen=True, slots=True)
 class SpatialPseudospatialSetup:
+    """Setup combining a spatial reference with a pseudospatial query.
+
+    Attributes:
+        seed: Random seed used to assign train/test splits.
+    """
+
     seed: int
 
 
 @dataclass(frozen=True, slots=True)
 class PseudospatialSetup:
+    """Setup for a pseudospatial dataset derived from a single-cell source.
+
+    Attributes:
+        panel_size: Number of top-ranked genes to retain.
+        panel_ordering: Strategy used to rank genes.
+        seed: Random seed used to assign train/test splits.
+    """
+
     panel_size: PositiveInt
     panel_ordering: GeneOrderingConfig
     seed: int
@@ -166,30 +263,74 @@ class PseudospatialSetup:
 
 @dataclass(frozen=True, slots=True)
 class NonSpatialSetup:
+    """Setup for a non-spatial single-cell dataset.
+
+    Attributes:
+        seed: Random seed used to assign train/test splits.
+    """
+
     seed: int
 
 
 @dataclass(frozen=True, slots=True)
 class SingleCellData:
+    """Reference to a single AnnData file used as a data source.
+
+    Attributes:
+        path: Path to an ``.h5ad`` file.
+        cluster_key: Column in ``adata.obs`` holding the cell-type annotation.
+    """
+
     path: FilePath
     cluster_key: str
 
 
 @dataclass(frozen=True, slots=True)
 class QueryPlusReference:
+    """Pair of single-cell datasets used as query and reference.
+
+    Attributes:
+        query: Dataset used as the query split.
+        reference: Dataset used as the reference/train split.
+    """
+
     query: SingleCellData
     reference: SingleCellData
 
 
 class CellAnnotationSchema(pa.DataFrameModel):
+    """Pandera schema for per-cell annotation rows."""
+
     barcode: str
     split: str = pa.Field(isin=["train", "test"])
     annotation: str
 
 
+def get_barcodes(
+    cell_annotation_df: DataFrame[CellAnnotationSchema],
+) -> dict[Literal["train", "test"], list[str]]:
+    """Group cell barcodes by split.
+
+    Args:
+        cell_annotation_df: Per-cell train/test annotations.
+
+    Returns:
+        Mapping ``split -> [barcode, ...]``.
+    """
+    return cell_annotation_df.groupby("split")["barcode"].apply(list).to_dict()
+
+
 def validate_single_cell_data(
     single_cell_data: SingleCellData,
 ) -> Result[SingleCellData, KeyError]:
+    """Validate that ``cluster_key`` exists in the referenced AnnData file.
+
+    Args:
+        single_cell_data: Reference to the AnnData file to check.
+
+    Returns:
+        ``Result[SingleCellData, KeyError]``.
+    """
     match single_cell_data:
         case SingleCellData(path, cluster_key):
             try:
@@ -213,6 +354,20 @@ type DatasetSetup = (
 def split_cells(
     dataset_setup: DatasetSetup,
 ) -> tuple[Result[DataFrame[CellAnnotationSchema], Exception], list[str]]:
+    """Build the train/test cell annotations for ``dataset_setup``.
+
+    Depending on the setup variant, this reads the relevant AnnData files,
+    restricts cells to those with annotations shared between splits, assigns
+    ``train``/``test`` labels (randomly for pseudospatial and non-spatial
+    setups, by file of origin otherwise), and validates the resulting table.
+
+    Args:
+        dataset_setup: Discriminated pair describing the dataset layout and
+            its data sources.
+
+    Returns:
+        ``(Result[DataFrame[CellAnnotationSchema], Exception], list[str])``.
+    """
     match dataset_setup:
         case SpatialSetup(), QueryPlusReference(
             SingleCellData(query_path, query_cluster_key),
@@ -295,7 +450,7 @@ def split_cells(
         lambda df: validate_pandas_pandera(CellAnnotationSchema, df),
     )
 
-    genes: list[str] = adata.var_names.tolist()
+    genes: list[str] = adata.var_names.tolist()  # type: ignore
     return annotation_result, genes
 
 
@@ -304,6 +459,17 @@ def get_dataset_counts(
     cell_barcodes: Sequence[str],
     gene_ids: Sequence[str],
 ) -> Result[NumericArray, Exception | ValueError]:
+    """Load a dense count matrix for ``cell_barcodes`` x ``gene_ids``.
+
+    Args:
+        single_cell_data: Reference to the AnnData file to load from.
+        cell_barcodes: Cell barcodes (rows) to subset.
+        gene_ids: Gene identifiers (columns) to subset.
+
+    Returns:
+        ``Result[NumericArray, Exception | ValueError]``.
+    """
+
     def get_counts(adata: AnnData) -> Result[NumericArray, ValueError]:
         if ~np.isin(gene_ids, adata.var_names):
             return Err(ValueError("gene_ids not found in adata"))
@@ -317,40 +483,58 @@ def get_dataset_counts(
 
     match single_cell_data:
         case SingleCellData(adata_path):
-            counts_result = bind_result(
+            return bind_result(
                 read_h5ad(adata_path, backed="r"),
                 get_counts,
             )
         case _:
             assert_never(single_cell_data)
-    return counts_result
-
-
-def resolve_single_cell_object(
-    dataset_setup: SingleCellData | QueryPlusReference, split: Literal["train", "test"]
-) -> SingleCellData:
-    match dataset_setup, split:
-        case SingleCellData(), _:
-            return dataset_setup
-        case QueryPlusReference(), "train":
-            return dataset_setup.reference
-        case QueryPlusReference(), "test":
-            return dataset_setup.query
-        case _:
-            assert_never(dataset_setup)
 
 
 def retrieve_counts(
     dataset_setup: DatasetSetup,
-    cell_annotation: DataFrame[CellAnnotationSchema],
-    gene_annotation: DataFrame[GeneAnnotationSchema],
-) -> Generator[NumericArray]:
+    cell_annotation_df: DataFrame[CellAnnotationSchema],
+    gene_annotation_df: DataFrame[GeneAnnotationSchema],
+) -> Generator[tuple[NonNegativeInt, AnnData, AnnData], None, None]:
+    """Yield per-sample AnnData train/test views for ``dataset_setup``.
+
+    Args:
+        dataset_setup: Discriminated pair describing the dataset layout and
+            its data sources.
+        cell_annotation_df: Per-cell train/test annotations.
+        gene_annotation_df: Per-sample gene panel annotations.
+
+    Yields:
+        Tuples of ``(sample_id, train_adata, test_adata)`` for each sample.
+
+    Raises:
+        NotImplementedError: This function is not yet implemented.
+    """
     raise NotImplementedError()
-    dataset_format, dataset = dataset_setup
-    match (dataset_format, dataset):
+    match dataset_setup:
         case SpatialSetup(), QueryPlusReference(SingleCellData(), SingleCellData()):
             pass
-        case SpatialSetup(), QueryPlusReference(SingleCellData(), SingleCellData()):
+        case SpatialPseudospatialSetup(), QueryPlusReference(
+            SingleCellData(), SingleCellData()
+        ):
+            pass
+        case PseudospatialSetup(), SingleCellData() | QueryPlusReference(
+            SingleCellData(), SingleCellData()
+        ):
+            pass
+        case NonSpatialSetup(), SingleCellData() | QueryPlusReference(
+            SingleCellData(), SingleCellData()
+        ):
             pass
         case _:
             assert_never(dataset_setup)
+    training_cells_mask, testing_cells_mask = (
+        (split := cell_annotation_df["split"].values) == "train",
+        split == "test",
+    )
+    _, _ = (
+        cell_annotation_df["barcode"][training_cells_mask],
+        cell_annotation_df["barcode"][testing_cells_mask],
+    )
+    for (sample_id,), sample_df in gene_annotation_df.groupby(["sample_id"]):
+        pass

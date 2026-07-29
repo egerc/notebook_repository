@@ -4,6 +4,12 @@ from collections.abc import Callable, Generator, Sequence
 from dataclasses import dataclass
 from typing import assert_never
 
+from numpy import intp, number
+from numpy.typing import NDArray
+
+type NumericArray = NDArray[number]
+type IndexArray = NDArray[intp]
+
 
 @dataclass(frozen=True, slots=True)
 class Ok[A]:
@@ -39,16 +45,20 @@ def bind_maybe[A, B](maybe_a: Maybe[A], func: Callable[[A], Maybe[B]]) -> Maybe[
             return func(value)
         case Nothing():
             return Nothing()
+        case _:
+            assert_never(maybe_a)
 
 
-def bind_result[A, B, E: Exception](
-    result: Result[A, E], func: Callable[[A], Result[B, E]]
-) -> Result[B, E]:
+def bind_result[A, B, E_1: Exception, E_2: Exception](
+    result: Result[A, E_1], func: Callable[[A], Result[B, E_2]]
+) -> Result[B, E_1 | E_2]:
     match result:
         case Ok(value):
             return func(value)
         case Err(reason):
             return Err(reason)
+        case _:
+            assert_never(result)
 
 
 def unwrap_result[A, E: Exception](
@@ -71,6 +81,10 @@ def ok_or[A, E: Exception](maybe_a: Maybe[A], exception: E) -> Result[A, E]:
             return Err(exception)
         case _:
             assert_never(maybe_a)
+
+
+def maybe_from_optional[A](value: A | None) -> Maybe[A]:
+    return Just(value) if value is not None else Nothing()
 
 
 def unwrap_maybe[A](maybe_a: Maybe[A], exception: Exception | None = None) -> A:
