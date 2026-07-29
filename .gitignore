@@ -212,8 +212,11 @@ data
 cache
 mlruns
 *.db
-*test*
+test_*
+*_test.*
 *.out
 *.sbatch
 *.csv
 *.svg
+!tests/
+!tests/**
