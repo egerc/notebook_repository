@@ -62,13 +62,15 @@ def bind_result[A, B, E_1: Exception, E_2: Exception](
 
 
 def unwrap_result[A, E: Exception](
-    result: Result[A, E], error_message: str | None = None
+    result: Result[A, E], exception: Exception | None = None
 ) -> A:
     match result:
         case Ok(value):
             return value
         case Err(reason):
-            raise (reason if error_message is None else ValueError(error_message))
+            if exception is not None:
+                raise exception from reason
+            raise reason
         case _:
             assert_never(result)
 
@@ -108,5 +110,18 @@ def rights[A, E: Exception](
                 yield value
             case Err(_) | Nothing():
                 continue
+            case _:
+                assert_never(result)
+
+
+def lefts[A, E: Exception](
+    results: Sequence[Result[A, E] | Maybe[A]],
+) -> Generator[Err[E] | Nothing, None, None]:
+    for result in results:
+        match result:
+            case Ok(_) | Just(_):
+                continue
+            case Err() | Nothing():
+                yield result
             case _:
                 assert_never(result)

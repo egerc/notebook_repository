@@ -3,23 +3,20 @@ from enum import StrEnum, auto
 from typing import assert_never
 
 import anndata as ad
+import numpy as np
 from anndata.typing import AnnData  # type: ignore
 from nico2_lib.predictors import NmfPredictor, ScviPredictor
-from pandera.typing.pandas import DataFrame
 
-from log_2026_07_23t08_09_06z.datasets import (
-    CellAnnotationSchema,
-    GeneAnnotationSchema,
-    QueryPlusReference,
-    SingleCellData,
-)
 from log_2026_07_23t08_09_06z.types import (
+    Err,
     IndexArray,
     NumericArray,
-    unwrap_maybe,
+    Ok,
+    Result,
+    bind_result,
     unwrap_result,
 )
-from log_2026_07_23t08_09_06z.utils import get_dense_counts, read_h5ad
+from log_2026_07_23t08_09_06z.utils import get_adata_table, get_dense_counts
 
 
 class FittingScope(StrEnum):
@@ -29,6 +26,7 @@ class FittingScope(StrEnum):
         GLOBAL: Fit on the full reference counts.
         CELLTYPE: Fit per cell type within the reference.
     """
+
     GLOBAL = auto()
     CELLTYPE = auto()
 
@@ -36,12 +34,62 @@ class FittingScope(StrEnum):
 type Model = NmfPredictor | ScviPredictor
 
 
+class PredictionScope(StrEnum):
+    """Scope at which predictions are produced.
+
+    Values:
+        GLOBAL: Predict across all cells jointly.
+        CELLTYPE: Predict per cell type.
+    """
+
+    GLOBAL = auto()
+    CELLTYPE = auto()
+
+
+def predict_counts(
+    model: Model,
+    reference: AnnData,
+    query: AnnData,
+) -> Result[AnnData, ValueError | AttributeError | TypeError]:
+    return bind_result(
+        bind_result(
+            bind_result(
+                get_dense_counts(reference),
+                lambda arr: Ok(model.fit(arr)),
+            ),
+            lambda model: Ok(
+                model.predict(
+                    unwrap_result(
+                        get_dense_counts(query),
+                        ValueError("Failed to extract counts from query"),
+                    ),
+                    np.arange(query.n_vars),
+                )
+            ),
+        ),
+        lambda model_output: Ok(
+            ad.AnnData(
+                X=model_output[1],
+                obs=unwrap_result(
+                    get_adata_table(query, "obs"),
+                    ValueError("Failed to extract obs from query"),
+                ),
+                var=unwrap_result(
+                    get_adata_table(reference, "var"),
+                    ValueError("Failed to extract var from reference"),
+                ),
+                obsm={"X_embedding": model_output[0]},  # type: ignore
+            )
+        ),
+    )
+
+
 def generate_results(
     model: Model,
-    annotation_df: DataFrame[CellAnnotationSchema],
-    dataset: SingleCellData | QueryPlusReference,
-    sample_df: DataFrame[GeneAnnotationSchema],
-) -> None:
+    reference: AnnData,
+    query: AnnData,
+    prediction_scope: PredictionScope,
+) -> Result[AnnData, ValueError | NotImplementedError | AttributeError | TypeError]:
     """Load the AnnData objects backing ``dataset`` for result generation.
 
     Args:
@@ -53,35 +101,20 @@ def generate_results(
     Raises:
         ValueError: If reading any backing ``.h5ad`` file fails.
     """
-    match dataset:
-        case SingleCellData(adata_path, _):
-            _ = unwrap_result(read_h5ad(adata_path))
-
-        case QueryPlusReference(
-            SingleCellData(query_path, _), SingleCellData(reference_path, _)
-        ):
-            _ = ad.concat(
-                [
-                    unwrap_result(read_h5ad(query_path)),
-                    unwrap_result(read_h5ad(reference_path)),
-                ]
-            )
-
-
-class PredictionScope(StrEnum):
-    """Scope at which predictions are produced.
-
-    Values:
-        GLOBAL: Predict across all cells jointly.
-        CELLTYPE: Predict per cell type.
-    """
-    GLOBAL = auto()
-    CELLTYPE = auto()
+    match prediction_scope:
+        case PredictionScope.GLOBAL:
+            return predict_counts(model, reference, query)
+        case PredictionScope.CELLTYPE:
+            return Err(NotImplementedError("CELLTYPE scope is not implemented"))
+        case _:
+            assert_never(prediction_scope)
 
 
 def fit_model(
     reference: AnnData, model: Model
-) -> Callable[[NumericArray, IndexArray], AnnData]:
+) -> Callable[
+    [NumericArray, IndexArray], Result[tuple[NumericArray, NumericArray], Exception]
+]:
     """Fit ``model`` on the dense counts of ``reference`` and return a predictor.
 
     Args:
@@ -95,10 +128,28 @@ def fit_model(
         ValueError: If reference counts cannot be densified.
         Exception: Propagated from ``model.fit`` or ``model.predict``.
     """
-    model.fit(
-        unwrap_maybe(
-            get_dense_counts(reference),
-            ValueError("Failed to extract counts from reference during model fitting"),
+
+    def get_prediction_function(
+        model: Model,
+    ) -> Callable[
+        [NumericArray, IndexArray], Result[tuple[NumericArray, NumericArray], Exception]
+    ]:
+        def predict(
+            x: NumericArray, indexer: IndexArray
+        ) -> Result[tuple[NumericArray, NumericArray], Exception]:
+            try:
+                return Ok(model.predict(x, indexer))
+            except Exception as e:  # noqa: BLE001
+                return Err(e)
+
+        return predict
+
+    return unwrap_result(
+        bind_result(
+            bind_result(
+                get_dense_counts(reference),
+                lambda training_counts: Ok(model.fit(training_counts)),
+            ),
+            lambda model: Ok(get_prediction_function(model)),
         )
     )
-    return lambda x, indexer: AnnData(model.predict(x, indexer))

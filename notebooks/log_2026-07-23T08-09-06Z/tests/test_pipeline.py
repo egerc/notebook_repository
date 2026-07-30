@@ -34,7 +34,6 @@ def test_dataset_setup(
 ):
     setup_datasets(
         datasets=datasets,
-        folder="./test",
         sampling_strategies=sampling_strategies,
         setup_strategies=setup_strategies,
         n_samples=5,

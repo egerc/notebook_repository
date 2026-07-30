@@ -1,6 +1,6 @@
 import io
-from collections.abc import Sequence
-from typing import Any, Literal, assert_never
+from collections.abc import Callable, Sequence
+from typing import Literal, assert_never
 
 import anndata as ad
 import numpy as np
@@ -14,9 +14,6 @@ from scipy.sparse import csc_array, csc_matrix, csr_array, csr_matrix
 
 from log_2026_07_23t08_09_06z.types import (
     Err,
-    Just,
-    Maybe,
-    Nothing,
     NumericArray,
     Ok,
     Result,
@@ -59,7 +56,9 @@ def read_h5ad(
         return Err(e)
 
 
-def get_dense_counts(adata: AnnData) -> Maybe[NumericArray]:
+def get_dense_counts(
+    adata: AnnData,
+) -> Result[NumericArray, AttributeError | TypeError]:
     """Return ``adata.X`` as a dense NumPy array.
 
     Args:
@@ -71,11 +70,13 @@ def get_dense_counts(adata: AnnData) -> Maybe[NumericArray]:
     """
     match counts := adata.X:
         case np.ndarray():
-            return Just(counts)
+            return Ok(counts)
         case csr_matrix() | csc_matrix() | csr_array() | csc_array():
-            return Just(counts.toarray())
+            return Ok(counts.toarray())
+        case None:
+            return Err(AttributeError(f"Empty field X for {adata}"))
         case _:
-            return Nothing()
+            return Err(TypeError(f"Unsupported storage type {type(counts)}"))
 
 
 def dataframe_to_json(df: pd.DataFrame) -> Result[str, ValueError]:
@@ -127,6 +128,7 @@ def pandas_pandera_from_json[S: pa.DataFrameModel](
     Returns:
         ``Result[DataFrame[S], Exception]``.
     """
+
     def _load_df() -> Result[pd.DataFrame, Exception]:
         try:
             return Ok(pd.read_json(io.StringIO(json_data)))
@@ -136,7 +138,20 @@ def pandas_pandera_from_json[S: pa.DataFrameModel](
     return bind_result(_load_df(), lambda df: validate_pandas_pandera(schema, df))
 
 
-def get_adata_obs_pandas(adata: AnnData) -> Result[pd.DataFrame, ValueError]:
+def transform_pandas_pandera[S1: pa.DataFrameModel, S2: pa.DataFrameModel](
+    schema: type[S2],
+    df: DataFrame[S1],
+    transform: Callable[[DataFrame[S1]], pd.DataFrame],
+) -> Result[DataFrame[S2], Exception]:
+    return bind_result(
+        Ok(transform(df)),
+        lambda df: validate_pandas_pandera(schema, df),
+    )
+
+
+def get_adata_table(
+    adata: AnnData, table_name: Literal["obs", "var"]
+) -> Result[pd.DataFrame, ValueError]:
     """Return ``adata.obs`` as a plain pandas DataFrame.
 
     Args:
@@ -145,13 +160,13 @@ def get_adata_obs_pandas(adata: AnnData) -> Result[pd.DataFrame, ValueError]:
     Returns:
         ``Result[pd.DataFrame, ValueError]``.
     """
-    match obs_df := adata.obs:
+    match df := adata.obs if table_name == "obs" else adata.var:
         case pd.DataFrame():
-            return Ok(obs_df)
+            return Ok(df)
         case Dataset2D():
             return Err(ValueError("adata.obs is a Dataset2D"))
         case _:
-            assert_never(obs_df)
+            assert_never(df)
 
 
 def extract_columns(
@@ -189,5 +204,5 @@ def slice_adata_obs(
         ``Result[pd.DataFrame, KeyError | ValueError]``.
     """
     return bind_result(
-        get_adata_obs_pandas(adata), lambda df: extract_columns(df, columns)
+        get_adata_table(adata, "obs"), lambda df: extract_columns(df, columns)
     )

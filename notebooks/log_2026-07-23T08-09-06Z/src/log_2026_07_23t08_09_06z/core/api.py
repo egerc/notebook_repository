@@ -1,11 +1,12 @@
 from collections.abc import Generator, Sequence
-from functools import cache, cached_property
+from functools import cached_property
 from itertools import product
-from pathlib import Path
 
+import anndata as ad
 import numpy as np
+import pandas as pd
+import pandera.pandas as pa
 from anndata import AnnData
-from pandas.io.pickle import pickle
 from pandera.typing.pandas import DataFrame
 from pydantic.dataclasses import dataclass
 from pydantic.types import NonNegativeInt, PositiveInt
@@ -21,22 +22,28 @@ from log_2026_07_23t08_09_06z.datasets import (
     SpatialPseudospatialSetup,
     SpatialSetup,
     get_barcodes,
-    get_dataset_counts,
+    get_dataset_filtered,
     get_gene_ids_by_sample,
     retrieve_counts,
     sample_genes,
     split_cells,
 )
-from log_2026_07_23t08_09_06z.models import Model, PredictionScope, fit_model, predict
+from log_2026_07_23t08_09_06z.models import (
+    Model,
+    PredictionScope,
+    generate_results,
+)
 from log_2026_07_23t08_09_06z.types import (
+    Err,
+    Ok,
+    Result,
     bind_result,
-    maybe_from_optional,
-    ok_or,
     unwrap_result,
 )
 from log_2026_07_23t08_09_06z.utils import (
     dataframe_to_json,
     pandas_pandera_from_json,
+    read_h5ad,
     validate_pandas_pandera,
 )
 
@@ -64,54 +71,39 @@ class DatasetConfiguration:
     _gene_annotation_data: str
 
     @classmethod
-    def from_setup(
+    def try_from_setup(
         cls,
         dataset: QueryPlusReference,
         setup_strategy: SetupStrategy,
         sampling_strategy: SamplingStrategy,
         n_samples: int,
         seed: NonNegativeInt,
-    ) -> "DatasetConfiguration":
-        """Build a configuration from a setup triple by running the splits.
-
-        Args:
-            dataset: Query/reference pair to build the configuration from.
-            setup_strategy: Discriminator describing the dataset layout.
-            sampling_strategy: Strategy used to build the gene panels.
-            n_samples: Number of samples to draw gene panels for.
-            seed: Seed for the gene-panel random generator.
-
-        Returns:
-            A populated ``DatasetConfiguration``.
-
-        Raises:
-            ValueError: If cell or gene annotation generation/validation fails.
-        """
+    ) -> Result["DatasetConfiguration", Exception]:
         dataset_setup: DatasetSetup = (setup_strategy, dataset)  # type: ignore
-        cell_annotation_data, genes = (
-            unwrap_result(
-                bind_result(
-                    (results := split_cells(dataset_setup))[0], dataframe_to_json
+        cells_df_result, genes = split_cells(dataset_setup)
+
+        return bind_result(
+            cells_df_result,
+            lambda cells_df: bind_result(
+                dataframe_to_json(cells_df),
+                lambda cell_data: bind_result(
+                    sample_genes(
+                        genes, sampling_strategy, n_samples, np.random.default_rng(seed)
+                    ),
+                    lambda genes_df: bind_result(
+                        dataframe_to_json(genes_df),
+                        lambda gene_data: Ok(
+                            DatasetConfiguration(
+                                dataset=dataset,
+                                sampling_strategy=sampling_strategy,
+                                setup_strategy=setup_strategy,
+                                _cell_annotation_data=cell_data,
+                                _gene_annotation_data=gene_data,
+                            )
+                        ),
+                    ),
                 ),
-                "cell_annotation_df failure",
             ),
-            results[1],
-        )
-        gene_annotation_data = unwrap_result(
-            bind_result(
-                sample_genes(
-                    genes, sampling_strategy, n_samples, np.random.default_rng(seed)
-                ),
-                dataframe_to_json,
-            ),
-            "gene_annotation_df failure",
-        )
-        return DatasetConfiguration(
-            dataset=dataset,
-            sampling_strategy=sampling_strategy,
-            setup_strategy=setup_strategy,
-            _cell_annotation_data=cell_annotation_data,
-            _gene_annotation_data=gene_annotation_data,
         )
 
     @cached_property
@@ -161,6 +153,7 @@ def _(
     Raises:
         NotImplementedError: ``retrieve_counts`` is not yet implemented.
     """
+    raise NotImplementedError()
     for _, reference, query in retrieve_counts(
         dataset_setup=(  # type: ignore
             dataset_configuration.setup_strategy,
@@ -169,7 +162,48 @@ def _(
         cell_annotation_df=dataset_configuration.cell_annotation_df,
         gene_annotation_df=dataset_configuration.gene_annotation_df,
     ):
-        yield predict(reference, query, model, prediction_scope)
+        pass
+
+
+class ValidatedAnnData[S1: pa.DataFrameModel, S2: pa.DataFrameModel](ad.AnnData):
+    _adata: ad.AnnData
+
+    @classmethod
+    def from_dataset_configuration(
+        cls, dataset_configuration: DatasetConfiguration
+    ) -> "ValidatedAnnData[CellAnnotationSchema, GeneAnnotationSchema]":
+        reference = unwrap_result(
+            read_h5ad(dataset_configuration.dataset.reference.path)
+        )
+        query = unwrap_result(read_h5ad(dataset_configuration.dataset.query.path))
+        adata = ad.concat([reference, query])
+        adata.obs = unwrap_result(
+            bind_result(
+                (
+                    Ok(obs_df)
+                    if isinstance(obs_df := adata.obs, pd.DataFrame)
+                    else Err(ValueError("adata.obs is not a DataFrame"))
+                ),
+                lambda df: validate_pandas_pandera(
+                    CellAnnotationSchema,
+                    df.join(dataset_configuration.cell_annotation_df),
+                ),
+            )
+        )
+        adata.var = unwrap_result(
+            bind_result(
+                (
+                    Ok(var_raw)
+                    if isinstance(var_raw := adata.var, pd.DataFrame)
+                    else Err(ValueError("adata.var is not a DataFrame"))
+                ),
+                lambda df: validate_pandas_pandera(
+                    GeneAnnotationSchema,
+                    df.join(dataset_configuration.gene_annotation_df),
+                ),
+            )
+        )
+        return ValidatedAnnData(adata)
 
 
 def setup_datasets(
@@ -178,7 +212,7 @@ def setup_datasets(
     setup_strategies: Sequence[SetupStrategy],
     n_samples: PositiveInt,
     seed: NonNegativeInt,
-) -> list[DatasetConfiguration]:
+) -> Generator[Result[DatasetConfiguration, Exception]]:
     """Materialize the cartesian product of dataset/strategy combinations.
 
     Args:
@@ -194,26 +228,20 @@ def setup_datasets(
     Raises:
         ValueError: If any configuration fails to build its annotations.
     """
-    dataset_configurations = [
-        DatasetConfiguration.from_setup(
-            dataset=dataset,
-            setup_strategy=setup_strategy,
-            sampling_strategy=sampling_strategy,
-            n_samples=n_samples,
-            seed=seed,
+
+    for dataset, setup_strategy, sampling_strategy in product(
+        datasets, setup_strategies, sampling_strategies
+    ):
+        yield DatasetConfiguration.try_from_setup(
+            dataset, setup_strategy, sampling_strategy, n_samples, seed
         )
-        for dataset, setup_strategy, sampling_strategy in product(
-            datasets, setup_strategies, sampling_strategies
-        )
-    ]
-    return dataset_configurations
 
 
-def run_experiment(
+def run_experiment_for_model_and_scope(
     dataset_configuration: DatasetConfiguration,
     model: Model,
     prediction_scope: PredictionScope,
-) -> dict[int, AnnData]:
+) -> dict[int, Result[AnnData, Exception]]:
     """Run a single experiment and collect per-sample predictions.
 
     Args:
@@ -227,22 +255,35 @@ def run_experiment(
     Raises:
         ValueError: If annotation loading or count retrieval fails.
     """
-    predictions: dict[int, AnnData] = {}
+
+    predictions: dict[int, Result[AnnData, Exception]] = {}
+    # a = group_cells_by_split(dataset_configuration.cell_annotation_df)
     barcodes = get_barcodes(dataset_configuration.cell_annotation_df)
-    for gene_ids in get_gene_ids_by_sample(
+    for sample_id, gene_ids in get_gene_ids_by_sample(
         dataset_configuration.gene_annotation_df
-    ).values():
-        get_dataset_counts(
-            dataset_configuration.dataset.reference,
-            barcodes["train"],
-            gene_ids["train"],
+    ).items():
+        all_genes = gene_ids["train"] + gene_ids["test"]
+        reference = unwrap_result(
+            get_dataset_filtered(
+                dataset_configuration.dataset.reference,
+                barcodes["train"],
+                all_genes,
+            )
         )
-        get_dataset_counts(
-            dataset_configuration.dataset.query,
-            barcodes["test"],
-            gene_ids["train"],
+        query = unwrap_result(
+            get_dataset_filtered(
+                dataset_configuration.dataset.query,
+                barcodes["test"],
+                gene_ids["train"],
+            )
         )
-        fit_model()
+        predictions[sample_id] = generate_results(
+            model,
+            reference,
+            query,
+            prediction_scope,
+        )
+    return predictions
 
 
 def postprocess(): ...

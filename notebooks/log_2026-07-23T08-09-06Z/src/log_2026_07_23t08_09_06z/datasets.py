@@ -10,19 +10,17 @@ from anndata.typing import AnnData  # type: ignore
 from pandera.typing.pandas import DataFrame
 from pydantic.dataclasses import dataclass
 from pydantic.types import FilePath, NonNegativeInt, PositiveInt
+from sklearn.model_selection import train_test_split
 
 from log_2026_07_23t08_09_06z.types import (
     Err,
     IndexArray,
-    NumericArray,
     Ok,
     Result,
     bind_result,
-    ok_or,
     unwrap_result,
 )
 from log_2026_07_23t08_09_06z.utils import (
-    get_dense_counts,
     read_h5ad,
     slice_adata_obs,
     validate_pandas_pandera,
@@ -305,6 +303,27 @@ class CellAnnotationSchema(pa.DataFrameModel):
     split: str = pa.Field(isin=["train", "test"])
     annotation: str
 
+    @pa.dataframe_check
+    def check_split_annotation(cls, df: pd.DataFrame) -> bool:
+        train_labels = set(df.loc[df["split"] == "train", "annotation"])
+        test_labels = set(df.loc[df["split"] == "test", "annotation"])
+        return train_labels == test_labels
+
+
+class CellLabels(pa.DataFrameModel):
+    barcode: str
+    annotation: str
+
+
+def group_cells_by_split(
+    df: DataFrame[CellAnnotationSchema],
+) -> dict[Literal["train", "test"], Result[DataFrame[CellLabels], KeyError]]:
+    return {  # type: ignore
+        split: validate_pandas_pandera(CellLabels, sub_df[["barcode", "annotation"]])  # type: ignore
+        for split, sub_df in df.groupby("split")
+        if split in ("train", "test")
+    }
+
 
 def get_barcodes(
     cell_annotation_df: DataFrame[CellAnnotationSchema],
@@ -351,6 +370,52 @@ type DatasetSetup = (
 )
 
 
+def _stratified_split(
+    adata: AnnData,
+    annotation_col: str,
+    test_size: float,
+    seed: int,
+) -> Result[pd.Series, ValueError]:
+    """Assign ``train``/``test`` to every cell, stratified by cell type.
+
+    The resulting series is guaranteed (modulo singleton cell types — see
+    below) to contain at least one cell of every annotation class in both
+    splits, which is what ``CellAnnotationSchema.check_split_annotation``
+    requires.
+
+    Args:
+        adata: Cells to split. ``adata.obs[annotation_col]`` provides labels.
+        annotation_col: Column in ``adata.obs`` holding cell-type annotations.
+        test_size: Fraction of cells routed to the ``test`` split.
+        seed: Random seed used by the underlying splitter.
+
+    Returns:
+        ``Result[pd.Series, ValueError]`` — ``pd.Series`` of ``"train"`` /
+        ``"test"`` labels aligned to ``adata.obs.index``, or ``Err`` if any
+        cell type has fewer than 2 cells (stratified splitting is impossible
+        for singletons).
+    """
+    annotations = adata.obs[annotation_col].astype(str).to_numpy()
+    counts = pd.Series(annotations).value_counts()
+    singletons = counts[counts < 2]
+    if not singletons.empty:
+        return Err(
+            ValueError(
+                "Cannot stratified-split: cell type(s) with <2 cells after "
+                f"upstream filtering: {singletons.index.tolist()}."
+            )
+        )
+    train_idx, test_idx = train_test_split(
+        np.arange(len(adata)),
+        test_size=test_size,
+        random_state=seed,
+        stratify=annotations,
+    )
+    split = pd.Series("train", index=adata.obs_names)
+    split.iloc[test_idx] = "test"
+    return Ok(split)
+
+
 def split_cells(
     dataset_setup: DatasetSetup,
 ) -> tuple[Result[DataFrame[CellAnnotationSchema], Exception], list[str]]:
@@ -358,8 +423,11 @@ def split_cells(
 
     Depending on the setup variant, this reads the relevant AnnData files,
     restricts cells to those with annotations shared between splits, assigns
-    ``train``/``test`` labels (randomly for pseudospatial and non-spatial
-    setups, by file of origin otherwise), and validates the resulting table.
+    ``train``/``test`` labels (stratified by cell type for pseudospatial and
+    non-spatial setups, by file of origin otherwise), and validates the
+    resulting table. Stratification guarantees every cell type present in
+    ``adata`` also appears in both splits, satisfying
+    ``CellAnnotationSchema.check_split_annotation``.
 
     Args:
         dataset_setup: Discriminated pair describing the dataset layout and
@@ -409,18 +477,28 @@ def split_cells(
             )
             adata = adata[adata.obs["annotation"].isin(list(celltypes))].copy()
 
-            adata.obs["split"] = np.random.default_rng(seed).choice(
-                ["train", "test"], size=len(adata), p=[0.8, 0.2]
+            split_result = _stratified_split(
+                adata, "annotation", test_size=0.2, seed=seed
             )
+            match split_result:
+                case Ok(split):
+                    adata.obs["split"] = split.to_numpy()
+                case Err(e):
+                    return Err(e), []
         case PseudospatialSetup(panel_size, panel_ordering, seed), SingleCellData(
             adata_path, cluster_key
         ) | QueryPlusReference(_, SingleCellData(adata_path, cluster_key)):
             adata = ad.read_h5ad(adata_path)
             adata = adata[:, rank_genes(adata, panel_ordering)[:panel_size]].copy()
             adata.obs["annotation"] = adata.obs[cluster_key].values
-            adata.obs["split"] = np.random.default_rng(seed).choice(
-                ["train", "test"], size=len(adata), p=[0.8, 0.2]
+            split_result = _stratified_split(
+                adata, "annotation", test_size=0.2, seed=seed
             )
+            match split_result:
+                case Ok(split):
+                    adata.obs["split"] = split.to_numpy()
+                case Err(e):
+                    return Err(e), []
             celltypes: set[str] = set(adata.obs["annotation"].values)
         case NonSpatialSetup(seed), SingleCellData(
             adata_path, cluster_key
@@ -428,9 +506,14 @@ def split_cells(
             adata = ad.read_h5ad(adata_path)
             adata.obs["annotation"] = adata.obs[cluster_key].values
             celltypes: set[str] = set(adata.obs["annotation"].values)
-            adata.obs["split"] = np.random.default_rng(seed).choice(
-                ["train", "test"], size=len(adata), p=[0.8, 0.2]
+            split_result = _stratified_split(
+                adata, "annotation", test_size=0.2, seed=seed
             )
+            match split_result:
+                case Ok(split):
+                    adata.obs["split"] = split.to_numpy()
+                case Err(e):
+                    return Err(e), []
         case _:
             assert_never(dataset_setup)
 
@@ -454,11 +537,11 @@ def split_cells(
     return annotation_result, genes
 
 
-def get_dataset_counts(
+def get_dataset_filtered(
     single_cell_data: SingleCellData,
     cell_barcodes: Sequence[str],
     gene_ids: Sequence[str],
-) -> Result[NumericArray, Exception | ValueError]:
+) -> Result[AnnData, Exception | ValueError]:
     """Load a dense count matrix for ``cell_barcodes`` x ``gene_ids``.
 
     Args:
@@ -470,22 +553,23 @@ def get_dataset_counts(
         ``Result[NumericArray, Exception | ValueError]``.
     """
 
-    def get_counts(adata: AnnData) -> Result[NumericArray, ValueError]:
-        if ~np.isin(gene_ids, adata.var_names):
-            return Err(ValueError("gene_ids not found in adata"))
-        elif ~np.isin(cell_barcodes, adata.obs_names):
-            return Err(ValueError("cell_barcodes not found in adata"))
-        else:
-            return ok_or(
-                get_dense_counts(adata[cell_barcodes, gene_ids]),
-                ValueError("Counts empty"),
+    def stream_adata(
+        adata: AnnData,
+    ) -> Result[AnnData, AttributeError | TypeError | ValueError]:
+        if not set(gene_ids).issubset(adata.var_names):
+            return Err(ValueError("gene_ids need to be a subset of adata.var_names"))
+        elif not set(cell_barcodes).issubset(adata.obs_names):
+            return Err(
+                ValueError("cell_barcodes need to be a subset of adata.obs_names")
             )
+        else:
+            return Ok(adata[cell_barcodes, gene_ids])
 
     match single_cell_data:
         case SingleCellData(adata_path):
             return bind_result(
                 read_h5ad(adata_path, backed="r"),
-                get_counts,
+                stream_adata,
             )
         case _:
             assert_never(single_cell_data)
@@ -538,3 +622,8 @@ def retrieve_counts(
     )
     for (sample_id,), sample_df in gene_annotation_df.groupby(["sample_id"]):
         pass
+
+
+def join_table_adata[S: pa.DataFrameModel](
+    adata: AnnData, table: DataFrame[S], key: Literal["obs", "var"]
+) -> DataFrame[S]: ...
