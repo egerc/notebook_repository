@@ -9,7 +9,8 @@ import pandera.pandas as pa
 from anndata._core.xarray import Dataset2D
 from anndata.typing import AnnData  # type: ignore
 from pandera.typing.pandas import DataFrame
-from pydantic.types import FilePath, PositiveInt
+from pydantic.dataclasses import dataclass
+from pydantic.types import FilePath, NonNegativeInt, PositiveInt
 from scipy.sparse import csc_array, csc_matrix, csr_array, csr_matrix
 
 from log_2026_07_23t08_09_06z.types import (
@@ -186,7 +187,7 @@ def extract_columns(
         if isinstance(sliced, pd.DataFrame):
             return Ok(sliced)
         else:
-            return Err(ValueError("adata.obs is not a DataFrame"))
+            return Err(ValueError("dataframe is not a DataFrame"))
     except KeyError as e:
         return Err(ValueError(f"Column not found: {e}"))
 
@@ -206,3 +207,68 @@ def slice_adata_obs(
     return bind_result(
         get_adata_table(adata, "obs"), lambda df: extract_columns(df, columns)
     )
+
+
+@dataclass(frozen=True)
+class MinRange:
+    min_value: NonNegativeInt
+    span: PositiveInt
+
+
+type FilteringConfig = MinRange
+
+
+def filter_adata_label(
+    adata: AnnData, obs_key: str, filtering_config: FilteringConfig
+) -> Result[AnnData, ValueError]:
+    min_val = filtering_config.min_value
+    max_val = filtering_config.min_value + filtering_config.span
+
+    obs_res = get_adata_table(adata, "obs")
+    series_res = bind_result(
+        obs_res,
+        lambda df: (  # type: ignore
+            Ok(df[obs_key])
+            if obs_key in df.columns
+            else Err(ValueError(f"Column not found: {obs_key}"))
+        ),
+    )
+    cat_series_res = bind_result(
+        series_res,
+        lambda s: (  # type: ignore
+            Ok(s)
+            if pd.api.types.is_categorical_dtype(s) or pd.api.types.is_object_dtype(s)
+            else Err(
+                ValueError(
+                    f"Column '{obs_key}' must be categorical or string, got {s.dtype}"
+                )
+            )
+        ),
+    )
+    indices_res = bind_result(  # type: ignore
+        cat_series_res,
+        lambda s: Ok(  # type: ignore
+            s[  # type: ignore
+                s.isin(
+                    s.value_counts()
+                    .loc[lambda c: (c >= min_val) & (c <= max_val)]  # type: ignore
+                    .index
+                )
+            ].index  # type: ignore
+        ),
+    )
+    return bind_result(
+        indices_res,
+        lambda kept_indices: Ok(adata[kept_indices, :].copy()),  # type: ignore
+    )
+
+
+def safe_apply[**P, R](
+    func: Callable[P, R],
+    *args: P.args,
+    **kwargs: P.kwargs,
+) -> Result[R, Exception]:
+    try:
+        return Ok(func(*args, **kwargs))
+    except Exception as e:  # noqa
+        return Err(e)

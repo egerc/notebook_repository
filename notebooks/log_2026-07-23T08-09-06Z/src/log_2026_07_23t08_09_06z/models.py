@@ -1,4 +1,3 @@
-from collections.abc import Callable
 from enum import StrEnum, auto
 from typing import assert_never
 
@@ -14,7 +13,9 @@ from log_2026_07_23t08_09_06z.types import (
     Ok,
     Result,
     bind_result,
+    starmap_result,
     unwrap_result,
+    zip_result,
 )
 from log_2026_07_23t08_09_06z.utils import get_adata_table, get_dense_counts
 
@@ -46,41 +47,53 @@ class PredictionScope(StrEnum):
     CELLTYPE = auto()
 
 
+def fit_model(model: Model, counts: NumericArray) -> Result[Model, Exception]:
+    try:
+        return Ok(model.fit(counts))
+    except Exception as e:  # noqa
+        return Err(e)
+
+
+def model_predict(
+    model: Model, counts: NumericArray, indexer: IndexArray
+) -> Result[tuple[NumericArray, NumericArray], Exception]:
+    try:
+        return Ok(model.predict(counts, indexer))
+    except Exception as e:  # noqa
+        return Err(e)
+
+
+def transform_model_output(
+    model_output: tuple[NumericArray, NumericArray], query: AnnData, reference: AnnData
+) -> Result[AnnData, Exception]:
+    cell_embedding, feature_prediction = model_output
+    return starmap_result(
+        zip_result(get_adata_table(query, "obs"), get_adata_table(reference, "var")),
+        lambda obs, var: ad.AnnData(
+            X=feature_prediction,
+            obs=obs,
+            var=var,
+            obsm={"X_embedding": cell_embedding},  # type: ignore
+        ),
+    )
+
+
 def predict_counts(
     model: Model,
     reference: AnnData,
     query: AnnData,
-) -> Result[AnnData, ValueError | AttributeError | TypeError]:
+) -> Result[AnnData, ValueError | AttributeError | TypeError | Exception]:
     return bind_result(
         bind_result(
             bind_result(
                 get_dense_counts(reference),
-                lambda arr: Ok(model.fit(arr)),
+                lambda arr: fit_model(model, arr),
             ),
-            lambda model: Ok(
-                model.predict(
-                    unwrap_result(
-                        get_dense_counts(query),
-                        ValueError("Failed to extract counts from query"),
-                    ),
-                    np.arange(query.n_vars),
-                )
+            lambda model: model_predict(
+                model, unwrap_result(get_dense_counts(query)), np.arange(query.n_vars)
             ),
         ),
-        lambda model_output: Ok(
-            ad.AnnData(
-                X=model_output[1],
-                obs=unwrap_result(
-                    get_adata_table(query, "obs"),
-                    ValueError("Failed to extract obs from query"),
-                ),
-                var=unwrap_result(
-                    get_adata_table(reference, "var"),
-                    ValueError("Failed to extract var from reference"),
-                ),
-                obsm={"X_embedding": model_output[0]},  # type: ignore
-            )
-        ),
+        lambda model_output: transform_model_output(model_output, query, reference),
     )
 
 
@@ -89,7 +102,9 @@ def generate_results(
     reference: AnnData,
     query: AnnData,
     prediction_scope: PredictionScope,
-) -> Result[AnnData, ValueError | NotImplementedError | AttributeError | TypeError]:
+) -> Result[
+    AnnData, ValueError | NotImplementedError | AttributeError | TypeError | Exception
+]:
     """Load the AnnData objects backing ``dataset`` for result generation.
 
     Args:
@@ -105,51 +120,8 @@ def generate_results(
         case PredictionScope.GLOBAL:
             return predict_counts(model, reference, query)
         case PredictionScope.CELLTYPE:
-            return Err(NotImplementedError("CELLTYPE scope is not implemented"))
+            return Err(
+                NotImplementedError(f"{prediction_scope} is not yet implemented")
+            )
         case _:
             assert_never(prediction_scope)
-
-
-def fit_model(
-    reference: AnnData, model: Model
-) -> Callable[
-    [NumericArray, IndexArray], Result[tuple[NumericArray, NumericArray], Exception]
-]:
-    """Fit ``model`` on the dense counts of ``reference`` and return a predictor.
-
-    Args:
-        reference: AnnData whose counts are used for fitting.
-        model: Model to fit.
-
-    Returns:
-        A callable ``(x, indexer) -> AnnData`` that runs ``model.predict``.
-
-    Raises:
-        ValueError: If reference counts cannot be densified.
-        Exception: Propagated from ``model.fit`` or ``model.predict``.
-    """
-
-    def get_prediction_function(
-        model: Model,
-    ) -> Callable[
-        [NumericArray, IndexArray], Result[tuple[NumericArray, NumericArray], Exception]
-    ]:
-        def predict(
-            x: NumericArray, indexer: IndexArray
-        ) -> Result[tuple[NumericArray, NumericArray], Exception]:
-            try:
-                return Ok(model.predict(x, indexer))
-            except Exception as e:  # noqa: BLE001
-                return Err(e)
-
-        return predict
-
-    return unwrap_result(
-        bind_result(
-            bind_result(
-                get_dense_counts(reference),
-                lambda training_counts: Ok(model.fit(training_counts)),
-            ),
-            lambda model: Ok(get_prediction_function(model)),
-        )
-    )

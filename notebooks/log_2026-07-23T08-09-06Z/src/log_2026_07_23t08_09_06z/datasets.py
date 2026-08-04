@@ -1,4 +1,5 @@
 from collections.abc import Generator, Sequence
+from functools import cached_property
 from typing import Literal, assert_never
 
 import anndata as ad
@@ -17,10 +18,17 @@ from log_2026_07_23t08_09_06z.types import (
     IndexArray,
     Ok,
     Result,
+    SamplingSplit,
     bind_result,
+    map_err,
+    map_result,
     unwrap_result,
 )
 from log_2026_07_23t08_09_06z.utils import (
+    FilteringConfig,
+    dataframe_to_json,
+    filter_adata_label,
+    pandas_pandera_from_json,
     read_h5ad,
     slice_adata_obs,
     validate_pandas_pandera,
@@ -304,10 +312,15 @@ class CellAnnotationSchema(pa.DataFrameModel):
     annotation: str
 
     @pa.dataframe_check
-    def check_split_annotation(cls, df: pd.DataFrame) -> bool:
+    def check_split_annotation(cls, df: pd.DataFrame) -> pd.Series:
         train_labels = set(df.loc[df["split"] == "train", "annotation"])
         test_labels = set(df.loc[df["split"] == "test", "annotation"])
-        return train_labels == test_labels
+
+        # Find labels that exist in one set but not both
+        mismatched_labels = train_labels.symmetric_difference(test_labels)
+
+        # Returns True for valid rows, False for rows with problematic labels
+        return ~df["annotation"].isin(mismatched_labels)  # type: ignore
 
 
 class CellLabels(pa.DataFrameModel):
@@ -362,6 +375,7 @@ def validate_single_cell_data(
             assert_never(single_cell_data)
 
 
+# for now the fucntions only suport the case of pairing any of the setups with QueryPlusReference, the other valid types are for the future
 type DatasetSetup = (
     tuple[SpatialSetup, QueryPlusReference]
     | tuple[SpatialPseudospatialSetup, QueryPlusReference]
@@ -375,13 +389,12 @@ def _stratified_split(
     annotation_col: str,
     test_size: float,
     seed: int,
-) -> Result[pd.Series, ValueError]:
+) -> pd.Series:
     """Assign ``train``/``test`` to every cell, stratified by cell type.
 
-    The resulting series is guaranteed (modulo singleton cell types — see
-    below) to contain at least one cell of every annotation class in both
-    splits, which is what ``CellAnnotationSchema.check_split_annotation``
-    requires.
+    The resulting series is guaranteed (modulo tiny cell types — see below)
+    to contain at least one cell of every annotation class in both splits,
+    which is what ``CellAnnotationSchema.check_split_annotation`` requires.
 
     Args:
         adata: Cells to split. ``adata.obs[annotation_col]`` provides labels.
@@ -392,20 +405,12 @@ def _stratified_split(
     Returns:
         ``Result[pd.Series, ValueError]`` — ``pd.Series`` of ``"train"`` /
         ``"test"`` labels aligned to ``adata.obs.index``, or ``Err`` if any
-        cell type has fewer than 2 cells (stratified splitting is impossible
-        for singletons).
+        cell type has fewer than ``ceil(1 / test_size)`` cells (stratified
+        splitting cannot place at least one of every class in each split
+        otherwise).
     """
     annotations = adata.obs[annotation_col].astype(str).to_numpy()
-    counts = pd.Series(annotations).value_counts()
-    singletons = counts[counts < 2]
-    if not singletons.empty:
-        return Err(
-            ValueError(
-                "Cannot stratified-split: cell type(s) with <2 cells after "
-                f"upstream filtering: {singletons.index.tolist()}."
-            )
-        )
-    train_idx, test_idx = train_test_split(
+    _, test_idx = train_test_split(
         np.arange(len(adata)),
         test_size=test_size,
         random_state=seed,
@@ -413,11 +418,12 @@ def _stratified_split(
     )
     split = pd.Series("train", index=adata.obs_names)
     split.iloc[test_idx] = "test"
-    return Ok(split)
+    return split
 
 
 def split_cells(
     dataset_setup: DatasetSetup,
+    filtering_config: FilteringConfig,
 ) -> tuple[Result[DataFrame[CellAnnotationSchema], Exception], list[str]]:
     """Build the train/test cell annotations for ``dataset_setup``.
 
@@ -472,48 +478,64 @@ def split_cells(
             adata.obs["annotation"] = adata.obs[reference_cluster_key]
             query_adata = ad.read_h5ad(query_path, backed="r")
             query_adata.obs["annotation"] = query_adata.obs[query_cluster_key]
+            shared_genes = list(
+                set(query_adata.var_names).intersection(adata.var_names)
+            )
             celltypes: set[str] = set(adata.obs["annotation"].values) & set(
                 query_adata.obs["annotation"].values
             )
-            adata = adata[adata.obs["annotation"].isin(list(celltypes))].copy()
-
-            split_result = _stratified_split(
+            adata = unwrap_result(
+                map_result(
+                    bind_result(
+                        Ok(adata[adata.obs["annotation"].isin(list(celltypes))].copy()),
+                        lambda adata: filter_adata_label(
+                            adata, "annotation", filtering_config
+                        ),
+                    ),
+                    lambda adata: adata[:, shared_genes].copy(),
+                )
+            )
+            adata.obs["split"] = _stratified_split(
                 adata, "annotation", test_size=0.2, seed=seed
             )
-            match split_result:
-                case Ok(split):
-                    adata.obs["split"] = split.to_numpy()
-                case Err(e):
-                    return Err(e), []
+
         case PseudospatialSetup(panel_size, panel_ordering, seed), SingleCellData(
             adata_path, cluster_key
         ) | QueryPlusReference(_, SingleCellData(adata_path, cluster_key)):
             adata = ad.read_h5ad(adata_path)
             adata = adata[:, rank_genes(adata, panel_ordering)[:panel_size]].copy()
             adata.obs["annotation"] = adata.obs[cluster_key].values
-            split_result = _stratified_split(
+            celltypes: set[str] = set(adata.obs["annotation"].values)
+            adata = unwrap_result(
+                bind_result(
+                    Ok(adata[adata.obs["annotation"].isin(list(celltypes))].copy()),
+                    lambda adata: filter_adata_label(
+                        adata, "annotation", filtering_config
+                    ),
+                )
+            )
+            adata.obs["split"] = _stratified_split(
                 adata, "annotation", test_size=0.2, seed=seed
             )
-            match split_result:
-                case Ok(split):
-                    adata.obs["split"] = split.to_numpy()
-                case Err(e):
-                    return Err(e), []
+
             celltypes: set[str] = set(adata.obs["annotation"].values)
         case NonSpatialSetup(seed), SingleCellData(
             adata_path, cluster_key
         ) | QueryPlusReference(_, SingleCellData(adata_path, cluster_key)):
             adata = ad.read_h5ad(adata_path)
             adata.obs["annotation"] = adata.obs[cluster_key].values
-            celltypes: set[str] = set(adata.obs["annotation"].values)
-            split_result = _stratified_split(
+            celltypes = set(adata.obs["annotation"].values)
+            adata = unwrap_result(
+                bind_result(
+                    Ok(adata[adata.obs["annotation"].isin(list(celltypes))].copy()),
+                    lambda adata: filter_adata_label(
+                        adata, "annotation", filtering_config
+                    ),
+                )
+            )
+            adata.obs["split"] = _stratified_split(
                 adata, "annotation", test_size=0.2, seed=seed
             )
-            match split_result:
-                case Ok(split):
-                    adata.obs["split"] = split.to_numpy()
-                case Err(e):
-                    return Err(e), []
         case _:
             assert_never(dataset_setup)
 
@@ -530,7 +552,12 @@ def split_cells(
                 )
             ),
         ),
-        lambda df: validate_pandas_pandera(CellAnnotationSchema, df),
+        lambda df: map_err(
+            validate_pandas_pandera(CellAnnotationSchema, df),
+            lambda error: ValueError(
+                f"Failed to verify cell annotation schema for {dataset_setup=}; reason: {error}"
+            ),
+        ),
     )
 
     genes: list[str] = adata.var_names.tolist()  # type: ignore
@@ -627,3 +654,126 @@ def retrieve_counts(
 def join_table_adata[S: pa.DataFrameModel](
     adata: AnnData, table: DataFrame[S], key: Literal["obs", "var"]
 ) -> DataFrame[S]: ...
+
+
+type SetupStrategy = (
+    SpatialSetup | SpatialPseudospatialSetup | PseudospatialSetup | NonSpatialSetup
+)
+
+
+@dataclass(frozen=True)
+class DatasetConfiguration:
+    """Materialized dataset setup with serialized cell and gene annotations.
+
+    Attributes:
+        dataset: Query/reference pair backing the configuration.
+        sampling_strategy: Strategy used to build the gene panels.
+        setup_strategy: Discriminator describing the dataset layout.
+        _cell_annotation_data: JSON-serialized per-cell annotations.
+        _gene_annotation_data: JSON-serialized per-sample gene annotations.
+    """
+
+    dataset: QueryPlusReference
+    sampling_strategy: SamplingStrategy
+    setup_strategy: SetupStrategy
+    _cell_annotation_data: str
+    _gene_annotation_data: str
+
+    @classmethod
+    def try_from_setup(
+        cls,
+        dataset: QueryPlusReference,
+        setup_strategy: SetupStrategy,
+        sampling_strategy: SamplingStrategy,
+        n_samples: int,
+        seed: NonNegativeInt,
+        filtering_config: FilteringConfig,
+    ) -> Result["DatasetConfiguration", Exception]:
+        dataset_setup: tuple[SetupStrategy, QueryPlusReference] = (
+            setup_strategy,
+            dataset,
+        )  # type: ignore
+        cells_df_result: Result[DataFrame[CellAnnotationSchema], Exception]
+        cells_df_result, genes = split_cells(
+            dataset_setup,  # type: ignore
+            filtering_config,
+        )
+
+        return bind_result(
+            cells_df_result,
+            lambda cells_df: bind_result(
+                dataframe_to_json(cells_df),
+                lambda cell_data: bind_result(
+                    sample_genes(
+                        genes, sampling_strategy, n_samples, np.random.default_rng(seed)
+                    ),
+                    lambda genes_df: bind_result(
+                        dataframe_to_json(genes_df),
+                        lambda gene_data: Ok(
+                            DatasetConfiguration(
+                                dataset=dataset,
+                                sampling_strategy=sampling_strategy,
+                                setup_strategy=setup_strategy,
+                                _cell_annotation_data=cell_data,
+                                _gene_annotation_data=gene_data,
+                            )
+                        ),
+                    ),
+                ),
+            ),
+        )
+
+    @cached_property
+    def cell_annotation_df(self) -> DataFrame[CellAnnotationSchema]:
+        """Parsed and schema-validated per-cell annotations.
+
+        Returns:
+            ``DataFrame[CellAnnotationSchema]``.
+
+        Raises:
+            ValueError: If JSON parsing or schema validation fails.
+        """
+        return unwrap_result(
+            pandas_pandera_from_json(CellAnnotationSchema, self._cell_annotation_data)
+        )
+
+    @cached_property
+    def gene_annotation_df(self) -> DataFrame[GeneAnnotationSchema]:
+        """Parsed and schema-validated per-sample gene annotations.
+
+        Returns:
+            ``DataFrame[GeneAnnotationSchema]``.
+
+        Raises:
+            ValueError: If JSON parsing or schema validation fails.
+        """
+        return unwrap_result(
+            pandas_pandera_from_json(GeneAnnotationSchema, self._gene_annotation_data)
+        )
+
+
+def get_counts_per_cell_split(
+    setup_strategy: SetupStrategy,
+    query_plus_reference: QueryPlusReference,
+    barcodes: set[str],
+    gene_ids: set[str],
+    cell_split: SamplingSplit,
+) -> Result[AnnData, Exception]:
+    single_cell_data: SingleCellData
+    match combination := (setup_strategy, cell_split):
+        case SpatialSetup(), SamplingSplit.TEST:
+            single_cell_data = query_plus_reference.query
+        case (
+            SpatialPseudospatialSetup() | PseudospatialSetup() | NonSpatialSetup(),
+            _,
+        ) | (SpatialSetup(), SamplingSplit.TRAIN):
+            single_cell_data = query_plus_reference.reference
+        case _:
+            assert_never(combination)
+    return get_dataset_filtered(single_cell_data, list(barcodes), list(gene_ids))
+
+
+def get_split(sampling_split: SamplingSplit) -> Literal["train", "test"]:
+    if sampling_split == SamplingSplit.TRAIN:
+        return "train"
+    return "test"

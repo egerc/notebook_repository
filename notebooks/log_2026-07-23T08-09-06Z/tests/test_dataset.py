@@ -26,7 +26,7 @@ from log_2026_07_23t08_09_06z.datasets import (
     validate_single_cell_data,
 )
 from log_2026_07_23t08_09_06z.types import Result, unwrap_result
-from log_2026_07_23t08_09_06z.utils import validate_pandas_pandera
+from log_2026_07_23t08_09_06z.utils import MinRange, validate_pandas_pandera
 
 query_plus_reference = QueryPlusReference(
     unwrap_result(
@@ -60,7 +60,7 @@ query_plus_reference = QueryPlusReference(
 def test_setups(
     dataset_setup: DatasetSetup,
 ) -> None:
-    split_cells(dataset_setup)
+    split_cells(dataset_setup, MinRange(20, 1000))
 
 
 @pytest.mark.parametrize(
