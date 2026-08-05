@@ -1,11 +1,12 @@
 from collections.abc import Callable, Generator, Mapping, Sequence
 from functools import partial
 from itertools import product
-from typing import Literal
 
+import pandas as pd
 import pandera.pandas as pa
 from anndata import AnnData
 from pandera.typing.pandas import DataFrame
+from pydantic.dataclasses import dataclass
 from pydantic.types import FilePath, NonNegativeInt, PositiveInt
 from sklearn.utils.validation import joblib
 
@@ -18,7 +19,6 @@ from log_2026_07_23t08_09_06z.datasets import (
     get_counts_per_cell_split,
     get_gene_ids_by_sample,
     get_split,
-    retrieve_counts,
 )
 from log_2026_07_23t08_09_06z.evaluation import apply_reconstruction_scoring_func
 from log_2026_07_23t08_09_06z.models import (
@@ -43,36 +43,6 @@ from log_2026_07_23t08_09_06z.utils import (
 )
 
 
-def _(
-    dataset_configuration: DatasetConfiguration,
-    model: Model,
-    prediction_scope: PredictionScope,
-) -> Generator[AnnData, None, None]:
-    """Yield per-sample predictions across all retrieved counts.
-
-    Args:
-        dataset_configuration: Configuration describing the dataset.
-        model: Fitted or fit-on-the-fly model used for prediction.
-        prediction_scope: Scope passed to the model's prediction step.
-
-    Yields:
-        Per-sample predicted ``AnnData`` objects.
-
-    Raises:
-        NotImplementedError: ``retrieve_counts`` is not yet implemented.
-    """
-    raise NotImplementedError()
-    for _, reference, query in retrieve_counts(
-        dataset_setup=(  # type: ignore
-            dataset_configuration.setup_strategy,
-            dataset_configuration.dataset,
-        ),
-        cell_annotation_df=dataset_configuration.cell_annotation_df,
-        gene_annotation_df=dataset_configuration.gene_annotation_df,
-    ):
-        pass
-
-
 def setup_datasets(
     datasets: set[QueryPlusReference],
     sampling_strategies: set[SamplingStrategy],
@@ -80,6 +50,7 @@ def setup_datasets(
     n_samples: PositiveInt,
     seed: NonNegativeInt,
     filtering_config: FilteringConfig,
+    cache_dir: FilePath | None,
 ) -> Generator[Result[DatasetConfiguration, Exception]]:
     """Materialize the cartesian product of dataset/strategy combinations.
 
@@ -97,10 +68,15 @@ def setup_datasets(
         ValueError: If any configuration fails to build its annotations.
     """
 
+    setup_function = (
+        joblib.Memory(cache_dir).cache(DatasetConfiguration.try_from_setup)
+        if cache_dir is not None
+        else DatasetConfiguration.try_from_setup
+    )
     for dataset, setup_strategy, sampling_strategy in product(
         datasets, setup_strategies, sampling_strategies
     ):
-        yield DatasetConfiguration.try_from_setup(
+        yield setup_function(
             dataset,
             setup_strategy,
             sampling_strategy,
@@ -110,12 +86,19 @@ def setup_datasets(
         )
 
 
+@dataclass(frozen=True)
+class RunFeatures:
+    n_total_features: int
+    n_training_features: int
+    n_testing_features: int
+
+
 def run_experiment_for_model_and_scope(
     dataset_configuration: DatasetConfiguration,
     model: Model,
     prediction_scope: PredictionScope,
     cache_dir: FilePath | None,
-) -> Generator[tuple[int, EvaluationResult]]:
+) -> Generator[tuple[int, EvaluationResult, RunFeatures]]:
     """Run a single experiment and collect per-sample predictions.
 
     Args:
@@ -196,7 +179,12 @@ def run_experiment_for_model_and_scope(
                 ),
             ),
         )
-        yield sample_id, evaluation_result
+        run_features = RunFeatures(
+            n_total_features=len(all_genes),
+            n_training_features=len(gene_ids["train"]),
+            n_testing_features=len(gene_ids["test"]),
+        )
+        yield sample_id, evaluation_result, run_features
 
 
 class ExperimentResultSchema(pa.DataFrameModel):
@@ -213,10 +201,15 @@ class ExperimentResultSchema(pa.DataFrameModel):
     scoring_function: str
     cell_split: str = pa.Field(isin=["train", "test"])
     gene_split: str = pa.Field(isin=["train", "test"])
+    n_total_features: int
+    n_training_features: int
+    n_testing_features: int
     value: float
 
 
-type ExperimentParameters = tuple[DatasetConfiguration, int, Model, DatasetSplit, str]
+type ExperimentParameters = tuple[
+    DatasetConfiguration, int, Model, DatasetSplit, str, RunFeatures
+]
 
 
 def experiment(
@@ -228,7 +221,11 @@ def experiment(
 ) -> Generator[tuple[ExperimentParameters, Result[float, Exception]]]:
     for dataset_configuration in dataset_configurations:
         for model, prediction_scope, model_cache_dir in model_setups:
-            for sample_id, evaluation_result in run_experiment_for_model_and_scope(
+            for (
+                sample_id,
+                evaluation_result,
+                run_features,
+            ) in run_experiment_for_model_and_scope(
                 dataset_configuration, model, prediction_scope, model_cache_dir
             ):
                 for dataset_split, adata_tuple_result in evaluation_result.items():
@@ -248,7 +245,73 @@ def experiment(
                             model,
                             dataset_split,
                             scoring_function_name,
+                            run_features,
                         )
                         yield experiment_parameters, result_score
 
-def _(): ...
+
+def create_experiment_table(
+    value: list[tuple[ExperimentParameters, Result[float, Exception]]],
+) -> DataFrame[ExperimentResultSchema]:
+    """Materialize a typed experiment-result table from collected runs.
+
+    Each ``Err`` result is skipped; only successful ``Ok`` runs contribute a row.
+    The returned frame is validated against ``ExperimentResultSchema``.
+
+    Args:
+        value: Tuples of (parameters, scoring result) produced by ``experiment``.
+
+    Returns:
+        A ``DataFrame`` conforming to ``ExperimentResultSchema``.
+
+    Raises:
+        pandera.errors.SchemaError: If the constructed frame fails validation.
+    """
+    _MODEL_NAMES = {"NmfPredictor": "NMF", "ScviPredictor": "scVI"}
+
+    records: list[dict[str, object]] = []
+    for parameters, result in value:
+        match result:
+            case Err(reason):
+                print(
+                    f"Skipping result for parameters {parameters} due to error: {reason}"
+                )
+                continue
+            case Ok(metric):
+                (
+                    dataset_configuration,
+                    sample_id,
+                    model,
+                    dataset_split,
+                    scoring_function_name,
+                    run_features,
+                ) = parameters
+                records.append(
+                    {
+                        "query_path": str(dataset_configuration.dataset.query.path),
+                        "query_cluster_key": dataset_configuration.dataset.query.cluster_key,
+                        "reference_path": str(
+                            dataset_configuration.dataset.reference.path
+                        ),
+                        "reference_cluster_key": dataset_configuration.dataset.reference.cluster_key,
+                        "sample_id": sample_id,
+                        "setup_strategy": type(
+                            dataset_configuration.setup_strategy
+                        ).__name__.removesuffix("Setup"),
+                        "panel_sample_strategy": type(
+                            dataset_configuration.sampling_strategy
+                        ).__name__,
+                        "model": _MODEL_NAMES[type(model).__name__],
+                        "scoring_function": scoring_function_name,
+                        "cell_split": dataset_split.cell_split.value,
+                        "gene_split": dataset_split.gene_split.value,
+                        "n_total_features": run_features.n_total_features,
+                        "n_training_features": run_features.n_training_features,
+                        "n_testing_features": run_features.n_testing_features,
+                        "value": metric,
+                    }
+                )
+
+    columns = list(ExperimentResultSchema.to_schema().columns.keys())
+    df = pd.DataFrame(records, columns=columns)
+    return ExperimentResultSchema.validate(df)

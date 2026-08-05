@@ -12,6 +12,8 @@ dependencies = [
     "nico2-lib @ git+https://github.com/gruenlab/bioinfo-tools.git@135cda59c7dd9f886384b311627886fe1b743564#subdirectory=applications/nico2_lib",
     "pandera>=0.32.1",
     "pydantic>=2.13.4",
+    "pyyaml>=6.0.3",
+    "ruamel-yaml>=0.19.1",
     "scanpy>=1.12.2",
     "typer>=0.27.0",
 ]

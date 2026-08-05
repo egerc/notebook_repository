@@ -675,6 +675,9 @@ class DatasetConfiguration:
     _cell_annotation_data: str
     _gene_annotation_data: str
 
+    def __str__(self) -> str:
+        return f"DatasetConfiguration(dataset={self.dataset}, setup_strategy={self.setup_strategy}, sampling_strategy={self.sampling_strategy})"
+
     @classmethod
     def try_from_setup(
         cls,
