@@ -315,11 +315,7 @@ class CellAnnotationSchema(pa.DataFrameModel):
     def check_split_annotation(cls, df: pd.DataFrame) -> pd.Series:
         train_labels = set(df.loc[df["split"] == "train", "annotation"])
         test_labels = set(df.loc[df["split"] == "test", "annotation"])
-
-        # Find labels that exist in one set but not both
         mismatched_labels = train_labels.symmetric_difference(test_labels)
-
-        # Returns True for valid rows, False for rows with problematic labels
         return ~df["annotation"].isin(mismatched_labels)  # type: ignore
 
 
@@ -755,8 +751,8 @@ class DatasetConfiguration:
 def get_counts_per_cell_split(
     setup_strategy: SetupStrategy,
     query_plus_reference: QueryPlusReference,
-    barcodes: set[str],
-    gene_ids: set[str],
+    barcodes: Sequence[str],
+    gene_ids: Sequence[str],
     cell_split: SamplingSplit,
 ) -> Result[AnnData, Exception]:
     single_cell_data: SingleCellData
@@ -770,7 +766,7 @@ def get_counts_per_cell_split(
             single_cell_data = query_plus_reference.reference
         case _:
             assert_never(combination)
-    return get_dataset_filtered(single_cell_data, list(barcodes), list(gene_ids))
+    return get_dataset_filtered(single_cell_data, barcodes, gene_ids)
 
 
 def get_split(sampling_split: SamplingSplit) -> Literal["train", "test"]:

@@ -25,20 +25,8 @@ def _validate_adata_alignment(
                 )
             )
         if (var_names_true != var_names_pred).any():
-            only_in_true = var_names_true.difference(var_names_pred)
-            only_in_pred = var_names_pred.difference(var_names_true)
             return Err(
-                ValueError(
-                    "var_names mismatch between true and predicted AnnData "
-                    f"(true={len(var_names_true)} genes, pred={len(var_names_pred)} genes): "
-                    f"only-in-true={list(only_in_true[:5])}{'…' if len(only_in_true) > 5 else ''}, "
-                    f"only-in-pred={list(only_in_pred[:5])}{'…' if len(only_in_pred) > 5 else ''}"
-                    + (
-                        ""
-                        if only_in_true.size or only_in_pred.size
-                        else " (same set, different order)"
-                    )
-                )
+                ValueError("var_names mismatch between true and predicted AnnData")
             )
         obs_names_true, obs_names_pred = adata_true.obs_names, adata_pred.obs_names
         if len(obs_names_true) != len(obs_names_pred):
@@ -49,20 +37,8 @@ def _validate_adata_alignment(
             )
 
         if (obs_names_true != obs_names_pred).any():
-            only_in_true = obs_names_true.difference(obs_names_pred)
-            only_in_pred = obs_names_pred.difference(obs_names_true)
             return Err(
-                ValueError(
-                    "obs_names mismatch between true and predicted AnnData "
-                    f"(true={len(obs_names_true)} cells, pred={len(obs_names_pred)} cells): "
-                    f"only-in-true={list(only_in_true[:5])}{'…' if len(only_in_true) > 5 else ''}, "
-                    f"only-in-pred={list(only_in_pred[:5])}{'…' if len(only_in_pred) > 5 else ''}"
-                    + (
-                        ""
-                        if only_in_true.size or only_in_pred.size
-                        else " (same set, different order)"
-                    )
-                )
+                ValueError("obs_names mismatch between true and predicted AnnData")
             )
         return Ok((adata_true, adata_pred))
     except Exception as e:  # noqa

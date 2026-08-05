@@ -13,11 +13,16 @@ from log_2026_07_23t08_09_06z.types import (
     Ok,
     Result,
     bind_result,
+    starbind_result,
     starmap_result,
     unwrap_result,
     zip_result,
 )
-from log_2026_07_23t08_09_06z.utils import get_adata_table, get_dense_counts
+from log_2026_07_23t08_09_06z.utils import (
+    get_adata_table,
+    get_dense_counts,
+    validate_tokens,
+)
 
 
 class FittingScope(StrEnum):
@@ -83,17 +88,23 @@ def predict_counts(
     reference: AnnData,
     query: AnnData,
 ) -> Result[AnnData, ValueError | AttributeError | TypeError | Exception]:
-    return bind_result(
-        bind_result(
-            bind_result(
-                get_dense_counts(reference),
-                lambda arr: fit_model(model, arr),
+    query_var_names = query.var_names.tolist()
+    reference_var_names = reference.var_names.tolist()
+    unwrap_result(validate_tokens(query_var_names, reference_var_names))
+
+    return starbind_result(
+        starbind_result(
+            zip_result(
+                bind_result(
+                    get_dense_counts(reference), lambda arr: fit_model(model, arr)
+                ),
+                get_dense_counts(query),
             ),
-            lambda model: model_predict(
-                model, unwrap_result(get_dense_counts(query)), np.arange(query.n_vars)
-            ),
+            lambda model, arr: model_predict(model, arr, np.arange(query.n_vars)),
         ),
-        lambda model_output: transform_model_output(model_output, query, reference),
+        lambda embedding, prediction: transform_model_output(
+            (embedding, prediction), query, reference
+        ),
     )
 
 

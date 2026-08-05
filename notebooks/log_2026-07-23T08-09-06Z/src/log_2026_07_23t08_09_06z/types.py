@@ -6,6 +6,7 @@ from enum import StrEnum, auto
 from logging import Logger
 from typing import assert_never
 
+from anndata.typing import AnnData  # type: ignore
 from numpy import intp, number
 from numpy.typing import NDArray
 
@@ -24,7 +25,7 @@ class DatasetSplit:
     gene_split: SamplingSplit
 
 
-type EvaluationResult = dict[DatasetSplit, Result[float, Exception]]
+type EvaluationResult = dict[DatasetSplit, Result[tuple[AnnData, AnnData], Exception]]
 
 
 @dataclass(frozen=True, slots=True)
@@ -174,6 +175,24 @@ def log_result[A, E: Exception](
             logger.info(func(value))
         case Err(reason):
             logger.error(reason)
+
+
+def result_is_ok[A, E: Exception](result: Result[A, E]) -> bool:
+    match result:
+        case Ok(_):
+            return True
+        case Err(_):
+            return False
+        case _:
+            assert_never(result)
+
+
+def ok_if[A, E: Exception](
+    value: A, predicate: Callable[[A], bool], exception: E
+) -> Result[A, E]:
+    if predicate(value):
+        return Ok(value)
+    return Err(exception)
 
 
 def map_err[T, E: Exception, E2: Exception](

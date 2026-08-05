@@ -20,7 +20,9 @@ from log_2026_07_23t08_09_06z.types import (
     Result,
     bind_result,
     maybe_from_optional,
+    ok_if,
     ok_or,
+    zip_result,
 )
 
 
@@ -272,3 +274,62 @@ def safe_apply[**P, R](
         return Ok(func(*args, **kwargs))
     except Exception as e:  # noqa
         return Err(e)
+
+
+def validate_tokens[A](
+    tokens_1: Sequence[A], tokens_2: Sequence[A]
+) -> Result[tuple[Sequence[A], Sequence[A]], ValueError]:
+    """
+    Validates a couple properties:
+        - there are no duplicate values in either tokens_1 or tokens_2
+        - tokens_1 is shorter than tokens_2
+        - the values of tokens_2 are identical in value and sequence up to the length of tokens_1
+        - the values in tokens_2 beyond the length of tokens_1 are not found in tokens_1
+    """
+
+    def _unique_values(tokens: Sequence[A]) -> bool:
+        return len(set(tokens)) == len(tokens)
+
+    return bind_result(
+        bind_result(
+            bind_result(
+                zip_result(
+                    ok_if(
+                        tokens_1,
+                        _unique_values,
+                        ValueError("Duplicate tokens found in tokens_1"),
+                    ),
+                    ok_if(
+                        tokens_2,
+                        _unique_values,
+                        ValueError("Duplicate tokens found in tokens_2"),
+                    ),
+                ),
+                lambda token_tuple: ok_if(
+                    token_tuple,
+                    lambda token_tuple: len(token_tuple[0]) < len(token_tuple[1]),
+                    ValueError("tokens_1 must be shorter than tokens_2"),
+                ),
+            ),
+            lambda token_tuple: ok_if(
+                token_tuple,
+                lambda token_tuple: all(
+                    t1 == t2 for t1, t2 in zip(token_tuple[0], token_tuple[1])
+                ),
+                ValueError(
+                    "tokens_2 must be identical to tokens_1 up to the length of tokens_1"
+                ),
+            ),
+        ),
+        lambda token_tuple: ok_if(
+            token_tuple,
+            lambda token_tuple: (
+                not set(token_tuple[1][len(token_tuple[0]) :]).intersection(
+                    token_tuple[0]
+                )
+            ),
+            ValueError(
+                "No value in tokens_2 beyond length of tokens_1 is found in tokens_1"
+            ),
+        ),
+    )
