@@ -1,6 +1,7 @@
 from collections.abc import Callable, Generator, Mapping, Sequence
 from functools import partial
 from itertools import product
+from typing import assert_never
 
 import pandas as pd
 import pandera.pandas as pa
@@ -13,7 +14,10 @@ from sklearn.utils.validation import joblib
 from log_2026_07_23t08_09_06z.datasets import (
     DatasetConfiguration,
     QueryPlusReference,
+    SampleNonPanel,
+    SamplePanel,
     SamplingStrategy,
+    SamplingStrategyEither,
     SetupStrategy,
     get_barcodes,
     get_counts_per_cell_split,
@@ -68,7 +72,7 @@ def _cached_from_setup(
 
 def setup_datasets(
     datasets: set[QueryPlusReference],
-    sampling_strategies: set[SamplingStrategy],
+    sampling_strategies: set[SamplingStrategyEither],
     setup_strategies: set[SetupStrategy],
     n_samples: PositiveInt,
     seed: NonNegativeInt,
@@ -96,10 +100,11 @@ def setup_datasets(
         [
             QueryPlusReference,
             SetupStrategy,
-            SamplingStrategy,
+            SamplingStrategyEither,
             int,
             NonNegativeInt,
             FilteringConfig,
+            DownsamplingConfig,
         ],
         Result[DatasetConfiguration, Exception],
     ] = (  # type: ignore
@@ -117,6 +122,7 @@ def setup_datasets(
             n_samples,
             seed,
             filtering_config,
+            celltype_downsampling_config,
         )
 
 
@@ -147,7 +153,7 @@ def run_experiment_for_model_and_scope(
         ValueError: If annotation loading or count retrieval fails.
     """
     generate_results_function: Callable[
-        [Model, AnnData, AnnData, PredictionScope],
+        [Model, AnnData, AnnData, PredictionScope, QueryPlusReference],
         Result[AnnData, Exception],
     ] = (  # type: ignore
         joblib.Memory(cache_dir).cache(generate_results)
@@ -183,7 +189,11 @@ def run_experiment_for_model_and_scope(
                 ),
             ),
             lambda query, reference: generate_results_function(
-                model, reference, query, prediction_scope
+                model,
+                reference,
+                query,
+                prediction_scope,
+                dataset_configuration.dataset,
             ),
         )
 
@@ -234,7 +244,9 @@ class ExperimentResultSchema(pa.DataFrameModel):
     setup_strategy: str = pa.Field(
         isin=["Spatial", "SpatialPseudospatial", "Pseudospatial", "NonSpatial"]
     )
-    panel_sample_strategy: str = pa.Field(isin=["SampleRemainderPanel", "SamplePanel"])
+    panel_sample_strategy: str = pa.Field(
+        isin=["SampleNonPanel", "SamplePanel", "Both"]
+    )
     model: str = pa.Field(isin=["NMF", "scVI"])
     scoring_function: str
     cell_split: str = pa.Field(isin=["train", "test"])
@@ -288,6 +300,20 @@ def experiment(
                         yield experiment_parameters, result_score
 
 
+def _sampling_strategy_name(
+    sampling_strategy: SamplingStrategyEither,
+) -> str:
+    match sampling_strategy:
+        case SamplePanel():
+            return "SamplePanel"
+        case SampleNonPanel():
+            return "SampleNonPanel"
+        case tuple():
+            return "Both"
+        case _:
+            assert_never(sampling_strategy)
+
+
 def create_experiment_table(
     value: list[tuple[ExperimentParameters, Result[float, Exception]]],
 ) -> DataFrame[ExperimentResultSchema]:
@@ -336,9 +362,9 @@ def create_experiment_table(
                         "setup_strategy": type(
                             dataset_configuration.setup_strategy
                         ).__name__.removesuffix("Setup"),
-                        "panel_sample_strategy": type(
+                        "panel_sample_strategy": _sampling_strategy_name(
                             dataset_configuration.sampling_strategy
-                        ).__name__,
+                        ),
                         "model": _MODEL_NAMES[type(model).__name__],
                         "scoring_function": scoring_function_name,
                         "cell_split": dataset_split.cell_split.value,

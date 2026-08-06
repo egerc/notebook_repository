@@ -31,6 +31,7 @@ from log_2026_07_23t08_09_06z.types import (
 from log_2026_07_23t08_09_06z.utils import (
     FilteringConfig,
     dataframe_to_json,
+    downsample_clusters_by_split,
     filter_adata_label,
     pandas_pandera_from_json,
     read_h5ad,
@@ -125,7 +126,7 @@ class SamplePanel:
 
 
 @dataclass(frozen=True, slots=True)
-class SampleRemainderPanel:
+class SampleNonPanel:
     """Use a panel consisting of all genes except a fixed-size remainder.
 
     Attributes:
@@ -135,8 +136,8 @@ class SampleRemainderPanel:
     value: PositiveInt
 
 
-type SamplingStrategy = SamplePanel | SampleRemainderPanel
-type SamplingStrategyEither = EitherOrBoth[SamplePanel, SampleRemainderPanel]
+type SamplingStrategy = SamplePanel | SampleNonPanel
+type SamplingStrategyEither = EitherOrBoth[SamplePanel, SampleNonPanel]
 
 
 class GeneAnnotationSchema(pa.DataFrameModel):
@@ -169,12 +170,12 @@ def get_gene_ids_by_sample(
         return Err(e)
 
 
-def _sample_genes(
+def sample_genes(
     genes: Sequence[str],
-    sampling_strategy: EitherOrBoth[SamplePanel, SampleRemainderPanel],
+    sampling_strategy: EitherOrBoth[SamplePanel, SampleNonPanel],
     n_samples: PositiveInt,
-    rng: np.random.Generator,
-) -> Result[pd.DataFrame, ValueError]:
+    seed: NonNegativeInt,
+) -> Result[DataFrame[GeneAnnotationSchema], Exception]:
     """Sample train/test gene panels for each sample.
 
     For each sample, a permutation of ``genes`` is generated and split into a
@@ -182,23 +183,41 @@ def _sample_genes(
 
     Args:
         genes: Pool of gene names to sample from.
-        sampling_strategy: Determines how the train/test split is sized.
+        sampling_strategy: Case
+            SamplePanel(n) => n_train = n, n_test = n_total - n
+            SampleNonPanel(n) => n_train = n_total - n, n_test = n
+            (SamplePanel(n_panel), SampleNonPanel(n_nonpanel)) => n_train = n_panel, n_test = n_nonpanel
         n_samples: Number of samples to generate.
         rng: NumPy random generator used for shuffling.
 
     Returns:
         ``Result[pd.DataFrame, ValueError]``.
     """
+    rng = np.random.default_rng(seed)
     n_total = len(genes)
     genes_arr = np.asarray(genes)
+    n_train: NonNegativeInt
+    n_test: NonNegativeInt
     match sampling_strategy:
-        case SamplePanel():
-            return Err(NotImplementedError())
-        case SampleRemainderPanel():
-            return Err(NotImplementedError())
+        case SamplePanel(value):
+            if value > n_total:
+                return Err(
+                    ValueError(
+                        f"Panel gene count ({value}) exceeds total genes ({n_total})."
+                    )
+                )
+            n_train, n_test = value, n_total - value
+        case SampleNonPanel(value):
+            if value > n_total:
+                return Err(
+                    ValueError(
+                        f"Remainder gene count ({value}) exceeds total genes ({n_total})."
+                    )
+                )
+            n_train, n_test = n_total - value, value
         case (
             SamplePanel(n_panel_genes),
-            SampleRemainderPanel(n_panel_remainder_genes),
+            SampleNonPanel(n_panel_remainder_genes),
         ):
             if n_total < n_panel_genes + n_panel_remainder_genes:
                 return Err(
@@ -206,31 +225,31 @@ def _sample_genes(
                         f"Total genes count ({n_total}) is less than the sum of panel genes ({n_panel_genes}) and remainder genes ({n_panel_remainder_genes})."
                     )
                 )
-            return Err(NotImplementedError())
+            n_train, n_test = n_panel_genes, n_panel_remainder_genes
         case _:
             assert_never(sampling_strategy)
 
+    n_per_sample = n_train + n_test
+    sample_ids = np.repeat(np.arange(n_samples), n_per_sample)
+    splits = np.tile(
+        np.concatenate(
+            [
+                np.full(n_train, "train", dtype=object),
+                np.full(n_test, "test", dtype=object),
+            ]
+        ),
+        n_samples,
+    )
+    permuted_genes = np.empty(n_samples * n_per_sample, dtype=genes_arr.dtype)
+    for i in range(n_samples):
+        perm = rng.permutation(n_total)[:n_per_sample]
+        permuted_genes[i * n_per_sample : (i + 1) * n_per_sample] = genes_arr[perm]
+    df = pd.DataFrame(
+        {"sample_id": sample_ids, "split": splits, "gene": permuted_genes}
+    )
 
-def sample_genes(
-    genes: Sequence[str],
-    sampling_strategy: EitherOrBoth[SamplePanel, SampleRemainderPanel],
-    n_samples: PositiveInt,
-    rng: np.random.Generator,
-) -> Result[DataFrame[GeneAnnotationSchema], Exception]:
-    """Sample gene panels and validate the result against ``GeneAnnotationSchema``.
-
-    Args:
-        genes: Pool of gene names to sample from.
-        sampling_strategy: Determines how the train/test split is sized.
-        n_samples: Number of samples to generate.
-        rng: NumPy random generator used for shuffling.
-
-    Returns:
-        ``Result[DataFrame[GeneAnnotationSchema], Exception]``.
-    """
     return bind_result(
-        _sample_genes(genes, sampling_strategy, n_samples, rng),
-        lambda df: validate_pandas_pandera(GeneAnnotationSchema, df),
+        Ok(df), lambda df: validate_pandas_pandera(GeneAnnotationSchema, df)
     )
 
 
@@ -539,7 +558,16 @@ def split_cells(
     annotation_result = bind_result(
         bind_result(
             bind_result(
-                slice_adata_obs(adata, ["index", "annotation", "split"]),
+                bind_result(
+                    downsample_clusters_by_split(
+                        adata, "annotation", "split", downsampling_config
+                    )
+                    if downsampling_config is not None
+                    else Ok(adata),
+                    lambda adata: slice_adata_obs(
+                        adata, ["index", "annotation", "split"]
+                    ),
+                ),
                 lambda df: Ok(df.rename(columns={"index": "barcode"})),
             ),
             lambda df: Ok(
@@ -671,12 +699,12 @@ class DatasetConfiguration:
     """
 
     dataset: QueryPlusReference
-    sampling_strategy: SamplingStrategy
+    sampling_strategy: SamplingStrategyEither
     setup_strategy: SetupStrategy
     _cell_annotation_data: str
     _gene_annotation_data: str
 
-    def __str__(self) -> str:
+    def __repr__(self) -> str:
         return f"DatasetConfiguration(dataset={self.dataset}, setup_strategy={self.setup_strategy}, sampling_strategy={self.sampling_strategy})"
 
     @classmethod
@@ -684,7 +712,7 @@ class DatasetConfiguration:
         cls,
         dataset: QueryPlusReference,
         setup_strategy: SetupStrategy,
-        sampling_strategy: SamplingStrategy,
+        sampling_strategy: SamplingStrategyEither,
         n_samples: int,
         seed: NonNegativeInt,
         filtering_config: FilteringConfig,
@@ -704,9 +732,7 @@ class DatasetConfiguration:
             zip_result(
                 bind_result(cells_df_result, dataframe_to_json),
                 bind_result(
-                    sample_genes(
-                        genes, sampling_strategy, n_samples, np.random.default_rng(seed)
-                    ),
+                    sample_genes(genes, sampling_strategy, n_samples, seed),
                     dataframe_to_json,
                 ),
             ),

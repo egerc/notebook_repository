@@ -1,7 +1,8 @@
 import io
 import random
 from collections.abc import Callable, Generator, Sequence
-from itertools import chain
+from functools import partial
+from itertools import chain, groupby
 from pathlib import Path
 from typing import Literal, assert_never
 
@@ -23,14 +24,14 @@ from log_2026_07_23t08_09_06z.types import (
     Ok,
     Result,
     bind_result,
+    collect_result,
     map_result,
     maybe_from_optional,
     ok_if,
     ok_or,
     safe_apply_single,
-    starmap_result,
+    starbind_result,
     unwrap_result,
-    unwrap_result_or_default,
     zip_result,
 )
 
@@ -358,14 +359,43 @@ def group_barcodes_by_cluster(
 
 
 def downsample_values[A](
-    values: Sequence[A], downsampling_config: DownsamplingConfig
-) -> Result[list[A], Exception]:
+    n: PositiveInt,
+    n_samples: PositiveInt,
+    seed: NonNegativeInt,
+) -> Result[list[int], Exception]:
     return safe_apply_single(
-        value=(values, downsampling_config),
-        func=lambda combo: random.Random(combo[1].seed).sample(
-            combo[0], combo[1].value
-        ),
+        value=(range(n), n_samples, seed),
+        func=lambda combo: random.Random(combo[2]).sample(combo[0], combo[1]),
     )
+
+
+def slice_list_safe[A](
+    values: list[A], indices: list[int]
+) -> Result[list[A], Exception]:
+    try:
+        return Ok([values[index] for index in indices])
+    except Exception as e:  # noqa
+        return Err(e)
+
+
+def downsample_by_group[A](
+    values: list[A],
+    n_samples_per_class: PositiveInt,
+    seed: NonNegativeInt,
+) -> Generator[Result[list[int], Exception]]:
+    """Returns a generator that yields the downsampled values by each group in values."""
+    sorted_enumerated = sorted(enumerate(values), key=lambda x: x[1])  # type: ignore
+
+    for _, group in groupby(sorted_enumerated, key=lambda x: x[1]):  # type: ignore
+        entries = list(group)
+        indices = [index for index, _ in entries]
+        yield starbind_result(
+            zip_result(
+                Ok(indices),
+                downsample_values(len(entries), n_samples_per_class, seed),
+            ),
+            lambda values, idxs: slice_list_safe(values, idxs),  # type: ignore
+        )
 
 
 def slice_adata(
@@ -379,28 +409,92 @@ def slice_adata(
         case (None, gene_ids):
             return safe_apply_single(adata, lambda adata: adata[:, gene_ids].copy())
         case (barcodes, gene_ids):
-            return safe_apply_single(adata, lambda adata: adata[barcodes, gene_ids].copy())
+            return safe_apply_single(
+                adata, lambda adata: adata[barcodes, gene_ids].copy()
+            )
         case _:
             assert_never(indexers)
 
 
-def downsample_clusters(
-    adata: AnnData, cluster_key: str, downsampling_config: DownsamplingConfig
+def downsample_clusters_by_split(
+    adata: AnnData,
+    cluster_key: str,
+    split_key: str,
+    downsampling_config: DownsamplingConfig,
 ) -> Result[AnnData, Exception]:
-    return bind_result(
+    """VIBECODED"""
+    try:
+        if cluster_key not in adata.obs:
+            raise KeyError(f"'{cluster_key}' not found in adata.obs")
+        if split_key not in adata.obs:
+            raise KeyError(f"'{split_key}' not found in adata.obs")
+
+        rng = np.random.default_rng(downsampling_config.seed)
+        target_count = downsampling_config.value
+
+        grouped_indices = adata.obs.groupby(  # type: ignore
+            [cluster_key, split_key], observed=False
+        ).indices.values()
+
+        selected_indices = []
+        for indices in grouped_indices:
+            n_cells = len(indices)
+            if n_cells == 0:
+                continue
+            if n_cells <= target_count:
+                selected_indices.extend(indices)
+            else:
+                sampled = rng.choice(indices, size=target_count, replace=False)
+                selected_indices.extend(sampled)
+
+        selected_indices.sort()
+
+        return Ok(adata[selected_indices].copy())
+    except Exception as e:  # noqa
+        return Err(e)
+
+
+def _downsample_clusters_by_split(  # type: ignore
+    adata: AnnData,
+    cluster_key: str,
+    split_key: str,
+    downsampling_config: DownsamplingConfig,
+) -> Result[AnnData, Exception]:
+    raise NotImplementedError()
+
+    def extract_annotation(barcodes: list[str]) -> Result[list[str], Exception]:
+        try:
+            obs_df = get_adata_table(adata, "obs")
+            return map_result(obs_df, lambda df: df[split_key].values.tolist())
+        except Exception as e:  # noqa
+            return Err(e)
+
+    _ = map_result(
         map_result(
-            map_result(
-                group_barcodes_by_cluster(adata, cluster_key),
-                lambda generator: [
-                    unwrap_result_or_default(
-                        downsample_values(barcodes, downsampling_config), barcodes
-                    )
-                    for _, barcodes in generator
-                ],
+            group_barcodes_by_cluster(adata, cluster_key),
+            lambda groupby_cluster_generator: (
+                bind_result(
+                    bind_result(
+                        extract_annotation(barcodes),
+                        lambda annotation: map_result(
+                            collect_result(
+                                downsample_by_group(
+                                    annotation,
+                                    downsampling_config.value,
+                                    downsampling_config.seed,
+                                )
+                            ),
+                            lambda nested_barcode_indices: list(
+                                chain.from_iterable(nested_barcode_indices)
+                            ),
+                        ),
+                    ),
+                    partial(slice_list_safe, values=barcodes),
+                )
+                for _, barcodes in groupby_cluster_generator
             ),
-            lambda nested_barcodes: list(chain.from_iterable(nested_barcodes)),
         ),
-        lambda barcodes: slice_adata(adata, barcodes, None),
+        lambda x: x,
     )
 
 

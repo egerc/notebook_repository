@@ -243,6 +243,21 @@ def unwrap_maybe[A](maybe_a: Maybe[A], exception: Exception | None = None) -> A:
             assert_never(maybe_a)
 
 
+def collect_result[A, E: Exception](
+    generator: Generator[Result[A, E]],
+) -> Result[list[A], E]:
+    values = []
+    for result in generator:
+        match result:
+            case Ok(value):
+                values.append(value)
+            case Err(e):
+                return Err(e)
+            case _:
+                assert_never(result)
+    return Ok(values)
+
+
 def rights[A, E: Exception](
     results: Sequence[Result[A, E] | Maybe[A]],
 ) -> Generator[A, None, None]:
