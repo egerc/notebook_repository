@@ -28,6 +28,7 @@ from log_2026_07_23t08_09_06z.models import (
 )
 from log_2026_07_23t08_09_06z.types import (
     DatasetSplit,
+    DownsamplingConfig,
     Err,
     EvaluationResult,
     NumericArray,
@@ -35,12 +36,34 @@ from log_2026_07_23t08_09_06z.types import (
     Result,
     SamplingSplit,
     bind_result,
+    map_result,
     starbind_result,
+    unwrap_result,
     zip_result,
 )
 from log_2026_07_23t08_09_06z.utils import (
     FilteringConfig,
 )
+
+
+def _cached_from_setup(
+    dataset: QueryPlusReference,
+    setup_strategy: SetupStrategy,
+    sampling_strategy: SamplingStrategy,
+    n_samples: int,
+    seed: NonNegativeInt,
+    filtering_config: FilteringConfig,
+    downsampling_config: DownsamplingConfig | None,
+) -> Result[DatasetConfiguration, Exception]:
+    return DatasetConfiguration.try_from_setup(
+        dataset=dataset,
+        setup_strategy=setup_strategy,
+        sampling_strategy=sampling_strategy,
+        n_samples=n_samples,
+        seed=seed,
+        filtering_config=filtering_config,
+        downsampling_config=downsampling_config,
+    )
 
 
 def setup_datasets(
@@ -50,6 +73,7 @@ def setup_datasets(
     n_samples: PositiveInt,
     seed: NonNegativeInt,
     filtering_config: FilteringConfig,
+    celltype_downsampling_config: DownsamplingConfig,
     cache_dir: FilePath | None,
 ) -> Generator[Result[DatasetConfiguration, Exception]]:
     """Materialize the cartesian product of dataset/strategy combinations.
@@ -68,8 +92,18 @@ def setup_datasets(
         ValueError: If any configuration fails to build its annotations.
     """
 
-    setup_function = (
-        joblib.Memory(cache_dir).cache(DatasetConfiguration.try_from_setup)
+    setup_function: Callable[
+        [
+            QueryPlusReference,
+            SetupStrategy,
+            SamplingStrategy,
+            int,
+            NonNegativeInt,
+            FilteringConfig,
+        ],
+        Result[DatasetConfiguration, Exception],
+    ] = (  # type: ignore
+        joblib.Memory(cache_dir).cache(_cached_from_setup)
         if cache_dir is not None
         else DatasetConfiguration.try_from_setup
     )
@@ -122,11 +156,15 @@ def run_experiment_for_model_and_scope(
     )
 
     # a = group_cells_by_split(dataset_configuration.cell_annotation_df)
-    barcodes = get_barcodes(dataset_configuration.cell_annotation_df)
-    for sample_id, gene_ids in get_gene_ids_by_sample(
-        dataset_configuration.gene_annotation_df
+    barcodes = unwrap_result(
+        map_result(dataset_configuration.cell_annotation_df, get_barcodes)
+    )
+
+    for sample_id, gene_ids in unwrap_result(
+        bind_result(dataset_configuration.gene_annotation_df, get_gene_ids_by_sample)
     ).items():
         all_genes = gene_ids["train"] + gene_ids["test"]
+
         adata_prediction = starbind_result(
             zip_result(
                 get_counts_per_cell_split(

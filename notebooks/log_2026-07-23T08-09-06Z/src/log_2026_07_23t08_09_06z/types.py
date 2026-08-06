@@ -9,6 +9,7 @@ from typing import assert_never
 from anndata.typing import AnnData  # type: ignore
 from numpy import intp, number
 from numpy.typing import NDArray
+from pydantic.types import NonNegativeInt, PositiveInt
 
 type NumericArray = NDArray[number]
 type IndexArray = NDArray[intp]
@@ -25,7 +26,16 @@ class DatasetSplit:
     gene_split: SamplingSplit
 
 
+type EitherOrBoth[A, B] = A | B | tuple[A, B]
+
+
 type EvaluationResult = dict[DatasetSplit, Result[tuple[AnnData, AnnData], Exception]]
+
+
+@dataclass(frozen=True, slots=True)
+class DownsamplingConfig:
+    value: PositiveInt
+    seed: NonNegativeInt
 
 
 @dataclass(frozen=True, slots=True)

@@ -14,6 +14,8 @@ from pydantic.types import FilePath, NonNegativeInt, PositiveInt
 from sklearn.model_selection import train_test_split
 
 from log_2026_07_23t08_09_06z.types import (
+    DownsamplingConfig,
+    EitherOrBoth,
     Err,
     IndexArray,
     Ok,
@@ -22,7 +24,9 @@ from log_2026_07_23t08_09_06z.types import (
     bind_result,
     map_err,
     map_result,
+    starmap_result,
     unwrap_result,
+    zip_result,
 )
 from log_2026_07_23t08_09_06z.utils import (
     FilteringConfig,
@@ -80,7 +84,9 @@ def compute_hvgs(adata: AnnData) -> Result[IndexArray, ValueError]:
             assert_never(hvg_df)
 
 
-def rank_genes(adata: AnnData, gene_ordering: GeneOrderingConfig) -> IndexArray:
+def rank_genes(
+    adata: AnnData, gene_ordering: GeneOrderingConfig
+) -> Result[IndexArray, ValueError]:
     """Rank genes of ``adata`` according to ``gene_ordering``.
 
     Args:
@@ -96,10 +102,12 @@ def rank_genes(adata: AnnData, gene_ordering: GeneOrderingConfig) -> IndexArray:
     """
     match gene_ordering:
         case HighlyVariableGenes():
-            return unwrap_result(compute_hvgs(adata))
+            return compute_hvgs(adata)
         case Random(seed):
-            return np.random.default_rng(seed).choice(
-                adata.var_names, size=len(adata.var_names), replace=False
+            return Ok(
+                np.random.default_rng(seed).choice(
+                    adata.var_names, size=len(adata.var_names), replace=False
+                )
             )
         case _:
             assert_never(gene_ordering)
@@ -128,6 +136,7 @@ class SampleRemainderPanel:
 
 
 type SamplingStrategy = SamplePanel | SampleRemainderPanel
+type SamplingStrategyEither = EitherOrBoth[SamplePanel, SampleRemainderPanel]
 
 
 class GeneAnnotationSchema(pa.DataFrameModel):
@@ -140,7 +149,7 @@ class GeneAnnotationSchema(pa.DataFrameModel):
 
 def get_gene_ids_by_sample(
     gene_annotation_df: DataFrame[GeneAnnotationSchema],
-) -> dict[int, dict[Literal["train", "test"], list[str]]]:
+) -> Result[dict[int, dict[Literal["train", "test"], list[str]]], Exception]:
     """Group gene annotations by sample and split.
 
     Args:
@@ -149,17 +158,20 @@ def get_gene_ids_by_sample(
     Returns:
         Mapping ``sample_id -> {split: [gene, ...]}``.
     """
-    return (
-        gene_annotation_df.groupby(["sample_id", "split"])["gene"]
-        .apply(list)
-        .unstack(fill_value=[])  # type: ignore
-        .to_dict(orient="index")  # type: ignore
-    )
+    try:
+        return Ok(
+            gene_annotation_df.groupby(["sample_id", "split"])["gene"]
+            .apply(list)
+            .unstack(fill_value=[])  # type: ignore
+            .to_dict(orient="index")  # type: ignore
+        )
+    except Exception as e:  # noqa
+        return Err(e)
 
 
 def _sample_genes(
     genes: Sequence[str],
-    sampling_strategy: SamplingStrategy,
+    sampling_strategy: EitherOrBoth[SamplePanel, SampleRemainderPanel],
     n_samples: PositiveInt,
     rng: np.random.Generator,
 ) -> Result[pd.DataFrame, ValueError]:
@@ -180,42 +192,28 @@ def _sample_genes(
     n_total = len(genes)
     genes_arr = np.asarray(genes)
     match sampling_strategy:
-        case SamplePanel(n_genes):
-            n_train = n_genes
-        case SampleRemainderPanel(n_genes):
-            n_train = n_total - n_genes
+        case SamplePanel():
+            return Err(NotImplementedError())
+        case SampleRemainderPanel():
+            return Err(NotImplementedError())
+        case (
+            SamplePanel(n_panel_genes),
+            SampleRemainderPanel(n_panel_remainder_genes),
+        ):
+            if n_total < n_panel_genes + n_panel_remainder_genes:
+                return Err(
+                    ValueError(
+                        f"Total genes count ({n_total}) is less than the sum of panel genes ({n_panel_genes}) and remainder genes ({n_panel_remainder_genes})."
+                    )
+                )
+            return Err(NotImplementedError())
         case _:
             assert_never(sampling_strategy)
-    if not (0 <= n_train <= n_total):
-        return Err(
-            ValueError(
-                f"Invalid n_genes ({sampling_strategy.value}) for total genes count ({n_total})."
-            )
-        )
-    n_test = n_total - n_train
-    tiled_genes = np.tile(genes_arr, (n_samples, 1))
-    shuffled_genes = rng.permuted(tiled_genes, axis=1)
-    train_genes = shuffled_genes[:, :n_train]
-    test_genes = shuffled_genes[:, n_train:]
-    sample_ids = np.arange(n_samples)
-    train_sample_ids = np.repeat(sample_ids, n_train)
-    test_sample_ids = np.repeat(sample_ids, n_test)
-    df = pd.DataFrame(
-        {
-            "sample_id": np.concatenate([train_sample_ids, test_sample_ids]),
-            "split": np.repeat(
-                ["train", "test"], [n_samples * n_train, n_samples * n_test]
-            ),
-            "gene": np.concatenate([train_genes.ravel(), test_genes.ravel()]),
-        }
-    )
-
-    return Ok(df)
 
 
 def sample_genes(
     genes: Sequence[str],
-    sampling_strategy: SamplingStrategy,
+    sampling_strategy: EitherOrBoth[SamplePanel, SampleRemainderPanel],
     n_samples: PositiveInt,
     rng: np.random.Generator,
 ) -> Result[DataFrame[GeneAnnotationSchema], Exception]:
@@ -420,6 +418,7 @@ def _stratified_split(
 def split_cells(
     dataset_setup: DatasetSetup,
     filtering_config: FilteringConfig,
+    downsampling_config: DownsamplingConfig | None,
 ) -> tuple[Result[DataFrame[CellAnnotationSchema], Exception], list[str]]:
     """Build the train/test cell annotations for ``dataset_setup``.
 
@@ -499,7 +498,9 @@ def split_cells(
             adata_path, cluster_key
         ) | QueryPlusReference(_, SingleCellData(adata_path, cluster_key)):
             adata = ad.read_h5ad(adata_path)
-            adata = adata[:, rank_genes(adata, panel_ordering)[:panel_size]].copy()
+            adata = adata[
+                :, unwrap_result(rank_genes(adata, panel_ordering))[:panel_size]
+            ].copy()
             adata.obs["annotation"] = adata.obs[cluster_key].values
             celltypes: set[str] = set(adata.obs["annotation"].values)
             adata = unwrap_result(
@@ -687,6 +688,7 @@ class DatasetConfiguration:
         n_samples: int,
         seed: NonNegativeInt,
         filtering_config: FilteringConfig,
+        downsampling_config: DownsamplingConfig | None,
     ) -> Result["DatasetConfiguration", Exception]:
         dataset_setup: tuple[SetupStrategy, QueryPlusReference] = (
             setup_strategy,
@@ -696,34 +698,29 @@ class DatasetConfiguration:
         cells_df_result, genes = split_cells(
             dataset_setup,  # type: ignore
             filtering_config,
+            downsampling_config,
         )
-
-        return bind_result(
-            cells_df_result,
-            lambda cells_df: bind_result(
-                dataframe_to_json(cells_df),
-                lambda cell_data: bind_result(
+        return starmap_result(
+            zip_result(
+                bind_result(cells_df_result, dataframe_to_json),
+                bind_result(
                     sample_genes(
                         genes, sampling_strategy, n_samples, np.random.default_rng(seed)
                     ),
-                    lambda genes_df: bind_result(
-                        dataframe_to_json(genes_df),
-                        lambda gene_data: Ok(
-                            DatasetConfiguration(
-                                dataset=dataset,
-                                sampling_strategy=sampling_strategy,
-                                setup_strategy=setup_strategy,
-                                _cell_annotation_data=cell_data,
-                                _gene_annotation_data=gene_data,
-                            )
-                        ),
-                    ),
+                    dataframe_to_json,
                 ),
+            ),
+            lambda _cell_annotation_data, _gene_annotation_data: DatasetConfiguration(
+                dataset=dataset,
+                setup_strategy=setup_strategy,
+                sampling_strategy=sampling_strategy,
+                _cell_annotation_data=_cell_annotation_data,
+                _gene_annotation_data=_gene_annotation_data,
             ),
         )
 
     @cached_property
-    def cell_annotation_df(self) -> DataFrame[CellAnnotationSchema]:
+    def cell_annotation_df(self) -> Result[DataFrame[CellAnnotationSchema], Exception]:
         """Parsed and schema-validated per-cell annotations.
 
         Returns:
@@ -732,12 +729,12 @@ class DatasetConfiguration:
         Raises:
             ValueError: If JSON parsing or schema validation fails.
         """
-        return unwrap_result(
-            pandas_pandera_from_json(CellAnnotationSchema, self._cell_annotation_data)
+        return pandas_pandera_from_json(
+            CellAnnotationSchema, self._cell_annotation_data
         )
 
     @cached_property
-    def gene_annotation_df(self) -> DataFrame[GeneAnnotationSchema]:
+    def gene_annotation_df(self) -> Result[DataFrame[GeneAnnotationSchema], Exception]:
         """Parsed and schema-validated per-sample gene annotations.
 
         Returns:
@@ -746,8 +743,8 @@ class DatasetConfiguration:
         Raises:
             ValueError: If JSON parsing or schema validation fails.
         """
-        return unwrap_result(
-            pandas_pandera_from_json(GeneAnnotationSchema, self._gene_annotation_data)
+        return pandas_pandera_from_json(
+            GeneAnnotationSchema, self._gene_annotation_data
         )
 
 

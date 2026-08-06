@@ -1,5 +1,8 @@
 import io
-from collections.abc import Callable, Sequence
+import random
+from collections.abc import Callable, Generator, Sequence
+from itertools import chain
+from pathlib import Path
 from typing import Literal, assert_never
 
 import anndata as ad
@@ -14,14 +17,20 @@ from pydantic.types import FilePath, NonNegativeInt, PositiveInt
 from scipy.sparse import csc_array, csc_matrix, csr_array, csr_matrix
 
 from log_2026_07_23t08_09_06z.types import (
+    DownsamplingConfig,
     Err,
     NumericArray,
     Ok,
     Result,
     bind_result,
+    map_result,
     maybe_from_optional,
     ok_if,
     ok_or,
+    safe_apply_single,
+    starmap_result,
+    unwrap_result,
+    unwrap_result_or_default,
     zip_result,
 )
 
@@ -212,19 +221,17 @@ def slice_adata_obs(
 
 
 @dataclass(frozen=True)
-class MinRange:
-    min_value: NonNegativeInt
-    span: PositiveInt
+class Minimum:
+    value: NonNegativeInt
 
 
-type FilteringConfig = MinRange
+type FilteringConfig = Minimum
 
 
 def filter_adata_label(
     adata: AnnData, obs_key: str, filtering_config: FilteringConfig
 ) -> Result[AnnData, ValueError]:
-    min_val = filtering_config.min_value
-    max_val = filtering_config.min_value + filtering_config.span
+    min_val = filtering_config.value
 
     obs_res = get_adata_table(adata, "obs")
     series_res = bind_result(
@@ -253,7 +260,7 @@ def filter_adata_label(
             s[  # type: ignore
                 s.isin(
                     s.value_counts()
-                    .loc[lambda c: (c >= min_val) & (c <= max_val)]  # type: ignore
+                    .loc[lambda c: c >= min_val]  # type: ignore
                     .index
                 )
             ].index  # type: ignore
@@ -332,4 +339,76 @@ def validate_tokens[A](
                 "No value in tokens_2 beyond length of tokens_1 is found in tokens_1"
             ),
         ),
+    )
+
+
+def group_barcodes_by_cluster(
+    adata: AnnData, cluster_key: str
+) -> Result[Generator[tuple[str, list[str]], None, None], Exception]:
+    try:
+        obs_df = unwrap_result(get_adata_table(adata, "obs"))
+        groupby = obs_df.groupby(cluster_key)
+    except Exception as e:  # noqa
+        return Err(e)
+
+    return Ok(
+        (str(cluster), [str(barcode) for barcode in group.index.tolist()])
+        for cluster, group in groupby
+    )
+
+
+def downsample_values[A](
+    values: Sequence[A], downsampling_config: DownsamplingConfig
+) -> Result[list[A], Exception]:
+    return safe_apply_single(
+        value=(values, downsampling_config),
+        func=lambda combo: random.Random(combo[1].seed).sample(
+            combo[0], combo[1].value
+        ),
+    )
+
+
+def slice_adata(
+    adata: AnnData, barcodes: list[str] | None, gene_ids: list[str] | None
+) -> Result[AnnData, Exception]:
+    match indexers := (barcodes, gene_ids):
+        case (None, None):
+            return Ok(adata.copy())
+        case (barcodes, None):
+            return safe_apply_single(adata, lambda adata: adata[barcodes].copy())
+        case (None, gene_ids):
+            return safe_apply_single(adata, lambda adata: adata[:, gene_ids].copy())
+        case (barcodes, gene_ids):
+            return safe_apply_single(adata, lambda adata: adata[barcodes, gene_ids].copy())
+        case _:
+            assert_never(indexers)
+
+
+def downsample_clusters(
+    adata: AnnData, cluster_key: str, downsampling_config: DownsamplingConfig
+) -> Result[AnnData, Exception]:
+    return bind_result(
+        map_result(
+            map_result(
+                group_barcodes_by_cluster(adata, cluster_key),
+                lambda generator: [
+                    unwrap_result_or_default(
+                        downsample_values(barcodes, downsampling_config), barcodes
+                    )
+                    for _, barcodes in generator
+                ],
+            ),
+            lambda nested_barcodes: list(chain.from_iterable(nested_barcodes)),
+        ),
+        lambda barcodes: slice_adata(adata, barcodes, None),
+    )
+
+
+def load_adata() -> AnnData:
+    return unwrap_result(
+        read_h5ad(
+            Path(
+                "/home/gruengroup/christian/Data/mouse_intestine/intestine_scRNA.h5ad"
+            ),
+        )
     )
