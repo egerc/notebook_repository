@@ -141,13 +141,11 @@ def predict_counts_per_celltype(
         )
 
     def _predict_cluster(cluster: object) -> Result[AnnData, Exception]:
-        ref_sub = reference[reference_clusters.to_numpy() == cluster, :].copy()
-        query_sub = query[query_clusters.to_numpy() == cluster, :].copy()
+        ref_sub = reference[reference_clusters.to_numpy() == cluster, :]
+        query_sub = query[query_clusters.to_numpy() == cluster, :]
         return predict_counts(model, ref_sub, query_sub)
 
-    results = collect_result(
-        _predict_cluster(cluster) for cluster in common_clusters
-    )
+    results = collect_result(_predict_cluster(cluster) for cluster in common_clusters)
     return bind_result(
         results,
         lambda adatas: safe_apply(ad.concat, adatas, axis=0, join="inner"),

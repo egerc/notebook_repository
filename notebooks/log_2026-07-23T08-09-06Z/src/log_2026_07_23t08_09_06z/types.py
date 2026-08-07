@@ -29,7 +29,7 @@ class DatasetSplit:
 type EitherOrBoth[A, B] = A | B | tuple[A, B]
 
 
-type EvaluationResult = dict[DatasetSplit, Result[tuple[AnnData, AnnData], Exception]]
+type CountsTrueCountsPredMapping = dict[DatasetSplit, Result[tuple[AnnData, AnnData], Exception]]
 
 
 @dataclass(frozen=True, slots=True)

@@ -1,6 +1,8 @@
-from collections.abc import Callable
+from collections.abc import Callable, Generator
+from typing import assert_never
 
 from anndata.typing import AnnData  # type: ignore
+from pydantic.dataclasses import dataclass
 
 from log_2026_07_23t08_09_06z.types import (
     Err,
@@ -43,6 +45,49 @@ def _validate_adata_alignment(
         return Ok((adata_true, adata_pred))
     except Exception as e:  # noqa
         return Err(e)
+
+
+@dataclass(frozen=True, slots=True)
+class CellWise:
+    func: Callable[[NumericArray, NumericArray], float]  # Applies to 1D-Arrays
+
+
+@dataclass(frozen=True, slots=True)
+class GeneWise:
+    func: Callable[[NumericArray, NumericArray], float]  # Applies to 1D-Arrays
+
+
+@dataclass(frozen=True, slots=True)
+class PopulationCelltype:
+    func: Callable[[NumericArray, NumericArray], float]  # Applies to 2D-Arrays
+
+
+@dataclass(frozen=True, slots=True)
+class PopulationDataset:
+    func: Callable[[NumericArray, NumericArray], float]  # Applies to 2D-Arrays
+
+
+type ScoringSetup = CellWise | GeneWise | PopulationCelltype | PopulationDataset
+
+
+def apply_reconstruction_scoring_func_new(
+    adata_true: AnnData,
+    adata_pred: AnnData,
+    scoring_setup: ScoringSetup,
+) -> Result[Generator[Result[tuple[str, float], Exception]], Exception]:
+    generator_result: Result[Generator[Result[tuple[str, float], Exception]], Exception]
+    match scoring_setup:
+        case CellWise(func):
+            generator_result = Err(NotImplementedError())
+        case GeneWise(func):
+            generator_result = Err(NotImplementedError())
+        case PopulationCelltype(func):
+            generator_result = Err(NotImplementedError())
+        case PopulationDataset(func):
+            generator_result = Err(NotImplementedError())
+        case _:
+            assert_never(scoring_setup)
+    return generator_result
 
 
 def apply_reconstruction_scoring_func(

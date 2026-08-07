@@ -24,17 +24,21 @@ from log_2026_07_23t08_09_06z.datasets import (
     get_gene_ids_by_sample,
     get_split,
 )
-from log_2026_07_23t08_09_06z.evaluation import apply_reconstruction_scoring_func
+from log_2026_07_23t08_09_06z.evaluation import (
+    ScoringSetup,
+    apply_reconstruction_scoring_func,
+    apply_reconstruction_scoring_func_new,
+)
 from log_2026_07_23t08_09_06z.models import (
     Model,
     PredictionScope,
     generate_results,
 )
 from log_2026_07_23t08_09_06z.types import (
+    CountsTrueCountsPredMapping,
     DatasetSplit,
     DownsamplingConfig,
     Err,
-    EvaluationResult,
     NumericArray,
     Ok,
     Result,
@@ -138,7 +142,7 @@ def run_experiment_for_model_and_scope(
     model: Model,
     prediction_scope: PredictionScope,
     cache_dir: FilePath | None,
-) -> Generator[tuple[int, EvaluationResult, RunFeatures]]:
+) -> Generator[tuple[int, CountsTrueCountsPredMapping, RunFeatures]]:
     """Run a single experiment and collect per-sample predictions.
 
     Args:
@@ -205,7 +209,7 @@ def run_experiment_for_model_and_scope(
             except Exception as e:  # noqa
                 return Err(e)
 
-        evaluation_result: EvaluationResult = {}
+        evaluation_result: CountsTrueCountsPredMapping = {}
 
         dataset_split = DatasetSplit(SamplingSplit.TEST, SamplingSplit.TEST)
         split_barcodes = barcodes[get_split(dataset_split.cell_split)]
@@ -251,18 +255,78 @@ class ExperimentResultSchema(pa.DataFrameModel):
     scoring_function: str
     cell_split: str = pa.Field(isin=["train", "test"])
     gene_split: str = pa.Field(isin=["train", "test"])
+    prediction_scope: str = pa.Field(isin=["global", "celltype"])
+    scoring_setup: str = pa.Field(
+        isin=["cell_wise", "gene_wise", "population_celltype", "population_dataset"]
+    )
     n_total_features: int
     n_training_features: int
     n_testing_features: int
+    identifier: str
     value: float
 
 
 type ExperimentParameters = tuple[
-    DatasetConfiguration, int, Model, DatasetSplit, str, RunFeatures
+    DatasetConfiguration,
+    int,
+    Model,
+    DatasetSplit,
+    str,
+    PredictionScope,
+    ScoringSetup,
+    RunFeatures,
 ]
 
 
 def experiment(
+    dataset_configurations: Sequence[DatasetConfiguration],
+    model_setups: Sequence[
+        tuple[Model, PredictionScope, FilePath | None]
+    ],  # the optional string is the model specific caching directory
+    named_scoring_setups: set[tuple[str, ScoringSetup]],
+) -> Generator[
+    tuple[
+        ExperimentParameters,
+        Result[Generator[Result[tuple[str, float], Exception]], Exception],
+    ]
+]:
+    for dataset_configuration in dataset_configurations:
+        for model, prediction_scope, model_cache_dir in model_setups:
+            for (
+                sample_id,
+                count_true_counts_pred_mapping,
+                run_features,
+            ) in run_experiment_for_model_and_scope(
+                dataset_configuration, model, prediction_scope, model_cache_dir
+            ):
+                for (
+                    dataset_split,
+                    adata_tuple_result,
+                ) in count_true_counts_pred_mapping.items():
+                    for scoring_function_name, scoring_setup in named_scoring_setups:
+                        x = starbind_result(
+                            adata_tuple_result,
+                            partial(
+                                apply_reconstruction_scoring_func_new,
+                                scoring_setup=scoring_setup,
+                            ),
+                        )
+                        yield (
+                            (
+                                dataset_configuration,
+                                sample_id,
+                                model,
+                                dataset_split,
+                                scoring_function_name,
+                                prediction_scope,
+                                scoring_setup,
+                                run_features,
+                            ),
+                            x,
+                        )
+
+
+def experiment_deprecated(
     dataset_configurations: Sequence[DatasetConfiguration],
     model_setups: Sequence[
         tuple[Model, PredictionScope, FilePath | None]
@@ -295,6 +359,7 @@ def experiment(
                             model,
                             dataset_split,
                             scoring_function_name,
+                            prediction_scope,
                             run_features,
                         )
                         yield experiment_parameters, result_score
@@ -315,7 +380,12 @@ def _sampling_strategy_name(
 
 
 def create_experiment_table(
-    value: list[tuple[ExperimentParameters, Result[float, Exception]]],
+    value: Generator[
+        tuple[
+            ExperimentParameters,
+            Result[Generator[Result[tuple[str, float], Exception]], Exception],
+        ]
+    ],
 ) -> DataFrame[ExperimentResultSchema]:
     """Materialize a typed experiment-result table from collected runs.
 
@@ -341,40 +411,52 @@ def create_experiment_table(
                     f"Skipping result for parameters {parameters} due to error: {reason}"
                 )
                 continue
-            case Ok(metric):
+            case Ok(metric_generator):
                 (
                     dataset_configuration,
                     sample_id,
                     model,
                     dataset_split,
                     scoring_function_name,
+                    prediction_scope,
+                    scoring_setup,
                     run_features,
                 ) = parameters
-                records.append(
-                    {
-                        "query_path": str(dataset_configuration.dataset.query.path),
-                        "query_cluster_key": dataset_configuration.dataset.query.cluster_key,
-                        "reference_path": str(
-                            dataset_configuration.dataset.reference.path
-                        ),
-                        "reference_cluster_key": dataset_configuration.dataset.reference.cluster_key,
-                        "sample_id": sample_id,
-                        "setup_strategy": type(
-                            dataset_configuration.setup_strategy
-                        ).__name__.removesuffix("Setup"),
-                        "panel_sample_strategy": _sampling_strategy_name(
-                            dataset_configuration.sampling_strategy
-                        ),
-                        "model": _MODEL_NAMES[type(model).__name__],
-                        "scoring_function": scoring_function_name,
-                        "cell_split": dataset_split.cell_split.value,
-                        "gene_split": dataset_split.gene_split.value,
-                        "n_total_features": run_features.n_total_features,
-                        "n_training_features": run_features.n_training_features,
-                        "n_testing_features": run_features.n_testing_features,
-                        "value": metric,
-                    }
-                )
+                for metric_result in metric_generator:
+                    match metric_result:
+                        case Err(reason):
+                            pass
+                        case Ok(identifier_plus_value):
+                            records.append(
+                                {
+                                    "query_path": str(
+                                        dataset_configuration.dataset.query.path
+                                    ),
+                                    "query_cluster_key": dataset_configuration.dataset.query.cluster_key,
+                                    "reference_path": str(
+                                        dataset_configuration.dataset.reference.path
+                                    ),
+                                    "reference_cluster_key": dataset_configuration.dataset.reference.cluster_key,
+                                    "sample_id": sample_id,
+                                    "setup_strategy": type(
+                                        dataset_configuration.setup_strategy
+                                    ).__name__.removesuffix("Setup"),
+                                    "panel_sample_strategy": _sampling_strategy_name(
+                                        dataset_configuration.sampling_strategy
+                                    ),
+                                    "model": _MODEL_NAMES[type(model).__name__],
+                                    "scoring_function": scoring_function_name,
+                                    "cell_split": dataset_split.cell_split.value,
+                                    "gene_split": dataset_split.gene_split.value,
+                                    "prediction_scope": prediction_scope.value,
+                                    "scoring_setup": # fix this empty field,
+                                    "n_total_features": run_features.n_total_features,
+                                    "n_training_features": run_features.n_training_features,
+                                    "n_testing_features": run_features.n_testing_features,
+                                    "identifier": identifier_plus_value[0],
+                                    "value": identifier_plus_value[1],
+                                }
+                            )
 
     columns = list(ExperimentResultSchema.to_schema().columns.keys())
     df = pd.DataFrame(records, columns=columns)
