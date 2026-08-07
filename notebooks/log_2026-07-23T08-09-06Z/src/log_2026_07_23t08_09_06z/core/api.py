@@ -1,4 +1,4 @@
-from collections.abc import Callable, Generator, Mapping, Sequence
+from collections.abc import Callable, Generator, Sequence
 from functools import partial
 from itertools import product
 from typing import assert_never
@@ -25,8 +25,11 @@ from log_2026_07_23t08_09_06z.datasets import (
     get_split,
 )
 from log_2026_07_23t08_09_06z.evaluation import (
+    CellWise,
+    GeneWise,
+    PopulationCelltype,
+    PopulationDataset,
     ScoringSetup,
-    apply_reconstruction_scoring_func,
     apply_reconstruction_scoring_func_new,
 )
 from log_2026_07_23t08_09_06z.models import (
@@ -39,10 +42,13 @@ from log_2026_07_23t08_09_06z.types import (
     DatasetSplit,
     DownsamplingConfig,
     Err,
-    NumericArray,
+    Just,
+    Maybe,
+    Nothing,
     Ok,
     Result,
     SamplingSplit,
+    TransformedSpace,
     bind_result,
     map_result,
     starbind_result,
@@ -140,6 +146,7 @@ class RunFeatures:
 def run_experiment_for_model_and_scope(
     dataset_configuration: DatasetConfiguration,
     model: Model,
+    transformed_space: TransformedSpace,
     prediction_scope: PredictionScope,
     cache_dir: FilePath | None,
 ) -> Generator[tuple[int, CountsTrueCountsPredMapping, RunFeatures]]:
@@ -157,8 +164,15 @@ def run_experiment_for_model_and_scope(
         ValueError: If annotation loading or count retrieval fails.
     """
     generate_results_function: Callable[
-        [Model, AnnData, AnnData, PredictionScope, QueryPlusReference],
-        Result[AnnData, Exception],
+        [
+            Model,
+            AnnData,
+            AnnData,
+            PredictionScope,
+            QueryPlusReference,
+            TransformedSpace,
+        ],
+        Result[tuple[AnnData, TransformedSpace], Exception],
     ] = (  # type: ignore
         joblib.Memory(cache_dir).cache(generate_results)
         if cache_dir is not None
@@ -198,14 +212,22 @@ def run_experiment_for_model_and_scope(
                 query,
                 prediction_scope,
                 dataset_configuration.dataset,
+                transformed_space,
             ),
         )
 
         def _slice_adata(
-            adata: AnnData, barcodes: Sequence[str], gene_ids: Sequence[str]
-        ) -> Result[AnnData, Exception]:
+            adata_and_transformation: tuple[AnnData, TransformedSpace],
+            barcodes: Sequence[str],
+            gene_ids: Sequence[str],
+        ) -> Result[tuple[AnnData, TransformedSpace], Exception]:
             try:
-                return Ok(adata[list(barcodes), list(gene_ids)])
+                return Ok(
+                    (
+                        adata_and_transformation[0][list(barcodes), list(gene_ids)],
+                        adata_and_transformation[1],
+                    )
+                )
             except Exception as e:  # noqa
                 return Err(e)
 
@@ -252,6 +274,7 @@ class ExperimentResultSchema(pa.DataFrameModel):
         isin=["SampleNonPanel", "SamplePanel", "Both"]
     )
     model: str = pa.Field(isin=["NMF", "scVI"])
+    model_transformed_space: str = pa.Field(isin=["raw", "log"])
     scoring_function: str
     cell_split: str = pa.Field(isin=["train", "test"])
     gene_split: str = pa.Field(isin=["train", "test"])
@@ -259,6 +282,7 @@ class ExperimentResultSchema(pa.DataFrameModel):
     scoring_setup: str = pa.Field(
         isin=["cell_wise", "gene_wise", "population_celltype", "population_dataset"]
     )
+    target_scoring_transformed_space: str = pa.Field(isin=["raw", "log"])
     n_total_features: int
     n_training_features: int
     n_testing_features: int
@@ -270,10 +294,12 @@ type ExperimentParameters = tuple[
     DatasetConfiguration,
     int,
     Model,
+    TransformedSpace,
     DatasetSplit,
     str,
     PredictionScope,
     ScoringSetup,
+    TransformedSpace,
     RunFeatures,
 ]
 
@@ -281,9 +307,9 @@ type ExperimentParameters = tuple[
 def experiment(
     dataset_configurations: Sequence[DatasetConfiguration],
     model_setups: Sequence[
-        tuple[Model, PredictionScope, FilePath | None]
+        tuple[Model, PredictionScope, TransformedSpace, FilePath | None]
     ],  # the optional string is the model specific caching directory
-    named_scoring_setups: set[tuple[str, ScoringSetup]],
+    named_scoring_setups: set[tuple[str, ScoringSetup, TransformedSpace]],
 ) -> Generator[
     tuple[
         ExperimentParameters,
@@ -291,24 +317,38 @@ def experiment(
     ]
 ]:
     for dataset_configuration in dataset_configurations:
-        for model, prediction_scope, model_cache_dir in model_setups:
+        for (
+            model,
+            prediction_scope,
+            model_transformed_space,
+            model_cache_dir,
+        ) in model_setups:
             for (
                 sample_id,
                 count_true_counts_pred_mapping,
                 run_features,
             ) in run_experiment_for_model_and_scope(
-                dataset_configuration, model, prediction_scope, model_cache_dir
+                dataset_configuration,
+                model,
+                model_transformed_space,
+                prediction_scope,
+                model_cache_dir,
             ):
                 for (
                     dataset_split,
                     adata_tuple_result,
                 ) in count_true_counts_pred_mapping.items():
-                    for scoring_function_name, scoring_setup in named_scoring_setups:
+                    for (
+                        scoring_function_name,
+                        scoring_setup,
+                        target_scoring_transformed_space,
+                    ) in named_scoring_setups:
                         x = starbind_result(
                             adata_tuple_result,
                             partial(
                                 apply_reconstruction_scoring_func_new,
                                 scoring_setup=scoring_setup,
+                                target_scoring_space=target_scoring_transformed_space,
                             ),
                         )
                         yield (
@@ -316,53 +356,16 @@ def experiment(
                                 dataset_configuration,
                                 sample_id,
                                 model,
+                                model_transformed_space,
                                 dataset_split,
                                 scoring_function_name,
                                 prediction_scope,
                                 scoring_setup,
+                                target_scoring_transformed_space,
                                 run_features,
                             ),
                             x,
                         )
-
-
-def experiment_deprecated(
-    dataset_configurations: Sequence[DatasetConfiguration],
-    model_setups: Sequence[
-        tuple[Model, PredictionScope, FilePath | None]
-    ],  # the optional string is the model specific caching directory
-    evaluation_functions: Mapping[str, Callable[[NumericArray, NumericArray], float]],
-) -> Generator[tuple[ExperimentParameters, Result[float, Exception]]]:
-    for dataset_configuration in dataset_configurations:
-        for model, prediction_scope, model_cache_dir in model_setups:
-            for (
-                sample_id,
-                evaluation_result,
-                run_features,
-            ) in run_experiment_for_model_and_scope(
-                dataset_configuration, model, prediction_scope, model_cache_dir
-            ):
-                for dataset_split, adata_tuple_result in evaluation_result.items():
-                    for (
-                        scoring_function_name,
-                        scoring_function,
-                    ) in evaluation_functions.items():
-                        result_score = starbind_result(
-                            adata_tuple_result,
-                            partial(
-                                apply_reconstruction_scoring_func, func=scoring_function
-                            ),
-                        )
-                        experiment_parameters: ExperimentParameters = (
-                            dataset_configuration,
-                            sample_id,
-                            model,
-                            dataset_split,
-                            scoring_function_name,
-                            prediction_scope,
-                            run_features,
-                        )
-                        yield experiment_parameters, result_score
 
 
 def _sampling_strategy_name(
@@ -379,6 +382,20 @@ def _sampling_strategy_name(
             assert_never(sampling_strategy)
 
 
+def _scoring_setup_name(scoring_setup: ScoringSetup) -> str:
+    match scoring_setup:
+        case CellWise():
+            return "cell_wise"
+        case GeneWise():
+            return "gene_wise"
+        case PopulationCelltype():
+            return "population_celltype"
+        case PopulationDataset():
+            return "population_dataset"
+        case _:
+            assert_never(scoring_setup)
+
+
 def create_experiment_table(
     value: Generator[
         tuple[
@@ -386,7 +403,7 @@ def create_experiment_table(
             Result[Generator[Result[tuple[str, float], Exception]], Exception],
         ]
     ],
-) -> DataFrame[ExperimentResultSchema]:
+) -> Maybe[DataFrame[ExperimentResultSchema]]:
     """Materialize a typed experiment-result table from collected runs.
 
     Each ``Err`` result is skipped; only successful ``Ok`` runs contribute a row.
@@ -416,16 +433,20 @@ def create_experiment_table(
                     dataset_configuration,
                     sample_id,
                     model,
+                    model_transformed_space,
                     dataset_split,
                     scoring_function_name,
                     prediction_scope,
                     scoring_setup,
+                    target_scoring_transformed_space,
                     run_features,
                 ) = parameters
                 for metric_result in metric_generator:
                     match metric_result:
                         case Err(reason):
-                            pass
+                            print(
+                                f"Skipping result for parameters: {parameters} due to {reason}"
+                            )
                         case Ok(identifier_plus_value):
                             records.append(
                                 {
@@ -445,11 +466,13 @@ def create_experiment_table(
                                         dataset_configuration.sampling_strategy
                                     ),
                                     "model": _MODEL_NAMES[type(model).__name__],
+                                    "model_transformed_space": model_transformed_space.value,
                                     "scoring_function": scoring_function_name,
                                     "cell_split": dataset_split.cell_split.value,
                                     "gene_split": dataset_split.gene_split.value,
                                     "prediction_scope": prediction_scope.value,
-                                    "scoring_setup": # fix this empty field,
+                                    "scoring_setup": _scoring_setup_name(scoring_setup),
+                                    "target_scoring_transformed_space": target_scoring_transformed_space.value,
                                     "n_total_features": run_features.n_total_features,
                                     "n_training_features": run_features.n_training_features,
                                     "n_testing_features": run_features.n_testing_features,
@@ -459,5 +482,7 @@ def create_experiment_table(
                             )
 
     columns = list(ExperimentResultSchema.to_schema().columns.keys())
-    df = pd.DataFrame(records, columns=columns)
-    return ExperimentResultSchema.validate(df)
+    if not (df := pd.DataFrame(records, columns=columns)).empty:
+        return Just(ExperimentResultSchema.validate(df))
+    else:
+        return Nothing()

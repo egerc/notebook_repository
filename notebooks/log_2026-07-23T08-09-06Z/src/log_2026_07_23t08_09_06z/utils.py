@@ -23,6 +23,7 @@ from log_2026_07_23t08_09_06z.types import (
     NumericArray,
     Ok,
     Result,
+    TransformedSpace,
     bind_result,
     collect_result,
     map_result,
@@ -506,3 +507,27 @@ def load_adata() -> AnnData:
             ),
         )
     )
+
+
+def transform_space(
+    counts: NumericArray, source_space: TransformedSpace, target_space: TransformedSpace
+) -> NumericArray:
+    match source_space:
+        case TransformedSpace.RAW:
+            match target_space:
+                case TransformedSpace.RAW:
+                    return counts
+                case TransformedSpace.LOG:
+                    return np.log1p(counts)
+                case _:
+                    assert_never(target_space)
+        case TransformedSpace.LOG:
+            match target_space:
+                case TransformedSpace.RAW:
+                    return np.expm1(counts)
+                case TransformedSpace.LOG:
+                    return counts
+                case _:
+                    assert_never(target_space)
+        case _:
+            assert_never(source_space)

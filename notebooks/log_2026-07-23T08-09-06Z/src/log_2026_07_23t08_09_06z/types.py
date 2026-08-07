@@ -15,6 +15,11 @@ type NumericArray = NDArray[number]
 type IndexArray = NDArray[intp]
 
 
+class TransformedSpace(StrEnum):
+    RAW = auto()
+    LOG = auto()
+
+
 class SamplingSplit(StrEnum):
     TRAIN = auto()
     TEST = auto()
@@ -29,7 +34,9 @@ class DatasetSplit:
 type EitherOrBoth[A, B] = A | B | tuple[A, B]
 
 
-type CountsTrueCountsPredMapping = dict[DatasetSplit, Result[tuple[AnnData, AnnData], Exception]]
+type CountsTrueCountsPredMapping = dict[
+    DatasetSplit, Result[tuple[AnnData, tuple[AnnData, TransformedSpace]], Exception]
+]
 
 
 @dataclass(frozen=True, slots=True)
@@ -70,6 +77,16 @@ def bind_maybe[A, B](maybe_a: Maybe[A], func: Callable[[A], Maybe[B]]) -> Maybe[
     match maybe_a:
         case Just(value):
             return func(value)
+        case Nothing():
+            return Nothing()
+        case _:
+            assert_never(maybe_a)
+
+
+def map_maybe[A, B](maybe_a: Maybe[A], func: Callable[[A], B]) -> Maybe[B]:
+    match maybe_a:
+        case Just(value):
+            return Just(func(value))
         case Nothing():
             return Nothing()
         case _:

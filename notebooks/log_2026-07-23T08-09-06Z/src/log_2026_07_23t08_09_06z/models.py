@@ -13,6 +13,7 @@ from log_2026_07_23t08_09_06z.types import (
     NumericArray,
     Ok,
     Result,
+    TransformedSpace,
     bind_result,
     collect_result,
     starbind_result,
@@ -24,6 +25,7 @@ from log_2026_07_23t08_09_06z.utils import (
     get_adata_table,
     get_dense_counts,
     safe_apply,
+    transform_space,
     validate_tokens,
 )
 
@@ -55,23 +57,35 @@ class PredictionScope(StrEnum):
     CELLTYPE = auto()
 
 
-def fit_model(model: Model, counts: NumericArray) -> Result[Model, Exception]:
+def fit_model(
+    model: Model, counts: NumericArray, transformed_space: TransformedSpace
+) -> Result[Model, Exception]:
     try:
-        return Ok(model.fit(counts))
+        return Ok(
+            model.fit(transform_space(counts, TransformedSpace.RAW, transformed_space))
+        )
     except Exception as e:  # noqa
         return Err(e)
 
 
 def model_predict(
-    model: Model, counts: NumericArray, indexer: IndexArray
+    model: Model,
+    counts: NumericArray,
+    indexer: IndexArray,
+    transformed_space: TransformedSpace,
 ) -> Result[tuple[NumericArray, NumericArray], Exception]:
     try:
-        return Ok(model.predict(counts, indexer))
+        return Ok(
+            model.predict(
+                transform_space(counts, TransformedSpace.RAW, transformed_space),
+                indexer,
+            )
+        )
     except Exception as e:  # noqa
         return Err(e)
 
 
-def transform_model_output(
+def assign_model_output_to_anndata(
     model_output: tuple[NumericArray, NumericArray], query: AnnData, reference: AnnData
 ) -> Result[AnnData, Exception]:
     cell_embedding, feature_prediction = model_output
@@ -90,6 +104,7 @@ def predict_counts(
     model: Model,
     reference: AnnData,
     query: AnnData,
+    transformed_space: TransformedSpace,
 ) -> Result[AnnData, ValueError | AttributeError | TypeError | Exception]:
     query_var_names = query.var_names.tolist()
     reference_var_names = reference.var_names.tolist()
@@ -99,13 +114,16 @@ def predict_counts(
         starbind_result(
             zip_result(
                 bind_result(
-                    get_dense_counts(reference), lambda arr: fit_model(model, arr)
+                    get_dense_counts(reference),
+                    lambda arr: fit_model(model, arr, transformed_space),
                 ),
                 get_dense_counts(query),
             ),
-            lambda model, arr: model_predict(model, arr, np.arange(query.n_vars)),
+            lambda model, arr: model_predict(
+                model, arr, np.arange(query.n_vars), transformed_space
+            ),
         ),
-        lambda embedding, prediction: transform_model_output(
+        lambda embedding, prediction: assign_model_output_to_anndata(
             (embedding, prediction), query, reference
         ),
     )
@@ -117,6 +135,7 @@ def predict_counts_per_celltype(
     query: AnnData,
     query_cluster_key: str,
     reference_cluster_key: str,
+    transformed_space: TransformedSpace,
 ) -> Result[AnnData, ValueError | AttributeError | TypeError | Exception]:
     """
     similar to `predict_counts` but instead of predicting in one fell swoop, the results get produced iteratively per celltype and finally concatenated.
@@ -143,7 +162,7 @@ def predict_counts_per_celltype(
     def _predict_cluster(cluster: object) -> Result[AnnData, Exception]:
         ref_sub = reference[reference_clusters.to_numpy() == cluster, :]
         query_sub = query[query_clusters.to_numpy() == cluster, :]
-        return predict_counts(model, ref_sub, query_sub)
+        return predict_counts(model, ref_sub, query_sub, transformed_space)
 
     results = collect_result(_predict_cluster(cluster) for cluster in common_clusters)
     return bind_result(
@@ -158,8 +177,10 @@ def generate_results(
     query: AnnData,
     prediction_scope: PredictionScope,
     dataset: QueryPlusReference,
+    transformed_space: TransformedSpace,
 ) -> Result[
-    AnnData, ValueError | NotImplementedError | AttributeError | TypeError | Exception
+    tuple[AnnData, TransformedSpace],
+    ValueError | NotImplementedError | AttributeError | TypeError | Exception,
 ]:
     """Load the AnnData objects backing ``dataset`` for result generation.
 
@@ -174,14 +195,21 @@ def generate_results(
     """
     match prediction_scope:
         case PredictionScope.GLOBAL:
-            return predict_counts(model, reference, query)
+            return zip_result(
+                predict_counts(model, reference, query, transformed_space),
+                Ok(transformed_space),
+            )
         case PredictionScope.CELLTYPE:
-            return predict_counts_per_celltype(
-                model,
-                reference,
-                query,
-                dataset.query.cluster_key,
-                dataset.reference.cluster_key,
+            return zip_result(
+                predict_counts_per_celltype(
+                    model,
+                    reference,
+                    query,
+                    dataset.query.cluster_key,
+                    dataset.reference.cluster_key,
+                    transformed_space,
+                ),
+                Ok(transformed_space),
             )
         case _:
             assert_never(prediction_scope)
